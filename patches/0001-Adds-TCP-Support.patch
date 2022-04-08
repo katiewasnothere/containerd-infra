@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "Justin Terry (VM)" <juterry@microsoft.com>
+Date: Fri, 7 Sep 2018 14:30:49 -0700
+Subject: [PATCH] Adds TCP Support
+
+For testing only. Do not merge.
+---
+ pkg/dialer/dialer_windows.go | 16 +++++++++++++++-
+ sys/socket_windows.go        | 20 +++++++++++++++++---
+ 2 files changed, 32 insertions(+), 4 deletions(-)
+
+diff --git a/pkg/dialer/dialer_windows.go b/pkg/dialer/dialer_windows.go
+index 4dd296ebc..bb7cef7e8 100644
+--- a/pkg/dialer/dialer_windows.go
++++ b/pkg/dialer/dialer_windows.go
+@@ -18,10 +18,13 @@ package dialer
+ 
+ import (
+ 	"net"
++	"net/url"
+ 	"os"
++	"strings"
+ 	"time"
+ 
+ 	winio "github.com/Microsoft/go-winio"
++	"github.com/pkg/errors"
+ )
+ 
+ func isNoent(err error) bool {
+@@ -29,7 +32,18 @@ func isNoent(err error) bool {
+ }
+ 
+ func dialer(address string, timeout time.Duration) (net.Conn, error) {
+-	return winio.DialPipe(address, &timeout)
++	if strings.HasPrefix(address, "\\\\") {
++		return winio.DialPipe(address, &timeout)
++	}
++	u, err := url.Parse(address)
++	if err != nil {
++		return nil, err
++	}
++	switch u.Scheme {
++	case "tcp":
++		return net.DialTimeout("tcp", u.Host, timeout)
++	}
++	return nil, errors.Errorf("unsupported protocol '%s'", u.Scheme)
+ }
+ 
+ // DialAddress returns the dial address
+diff --git a/sys/socket_windows.go b/sys/socket_windows.go
+index 1ae12bc51..16fc6a5a2 100644
+--- a/sys/socket_windows.go
++++ b/sys/socket_windows.go
+@@ -18,13 +18,27 @@ package sys
+ 
+ import (
+ 	"net"
++	"net/url"
++	"strings"
+ 
+ 	"github.com/Microsoft/go-winio"
++	"github.com/pkg/errors"
+ )
+ 
+-// GetLocalListener returns a Listernet out of a named pipe.
+-// `path` must be of the form of `\\.\pipe\<pipename>`
++// GetLocalListener returns a Listener out of a named pipe or tcp socket.
++// `path` must be of the form of `\\.\pipe\<pipename>` or tcp://<address>:port.
+ // (see https://msdn.microsoft.com/en-us/library/windows/desktop/aa365150)
+ func GetLocalListener(path string, uid, gid int) (net.Listener, error) {
+-	return winio.ListenPipe(path, nil)
++	if strings.HasPrefix(path, "\\\\") {
++		return winio.ListenPipe(path, nil)
++	}
++	u, err := url.Parse(path)
++	if err != nil {
++		return nil, err
++	}
++	switch u.Scheme {
++	case "tcp":
++		return net.Listen("tcp", u.Host)
++	}
++	return nil, errors.Errorf("unsupported protocol '%s'", u.Scheme)
+ }

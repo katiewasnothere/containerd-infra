@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Amit Barve <ambarve@microsoft.com>
+Date: Thu, 3 Jun 2021 12:26:14 -0700
+Subject: [PATCH] Snapshotter cleanup fix
+
+During snapshotter cleanup lcow/wcow snapshotters try to rename the snapshot directory
+before cleaning it up. This rename operation sometimes fails if the sandbox.vhdx file
+inside that directory is still open in some process (ideally it should not be open but can
+stay open in case of a crash or exception) or if the directory is busy for some other
+reason. However, if this rename operation fails we return that error and then the entire
+snapshot garbage collection operation fails. Due to this we end up not cleaning other
+snapshots which otherwise could have been cleaned up without any errors. If this goes on
+for a long time we will end up filling the entire disk with stale snapshots. This change
+fixes that issue by continuing the snapshot cleanup if the rename operation fails because
+of such open handles.
+
+Signed-off-by: Amit Barve <ambarve@microsoft.com>
+(cherry picked from commit 3eff521c9b3d2bbce48bc0f9138187b76a86b35e)
+---
+ snapshots/lcow/lcow.go       |  9 ++++++++-
+ snapshots/windows/windows.go | 37 ++++++++++++++++++------------------
+ 2 files changed, 27 insertions(+), 19 deletions(-)
+
+diff --git a/snapshots/lcow/lcow.go b/snapshots/lcow/lcow.go
+index 8c911c052..35091c6d1 100644
+--- a/snapshots/lcow/lcow.go
++++ b/snapshots/lcow/lcow.go
+@@ -232,7 +232,14 @@ func (s *snapshotter) Remove(ctx context.Context, key string) error {
+ 	path := s.getSnapshotDir(id)
+ 	renamed := s.getSnapshotDir("rm-" + id)
+ 	if err := os.Rename(path, renamed); err != nil && !os.IsNotExist(err) {
+-		return err
++		// Sometimes if there are some open handles to the files (especially VHD)
++		// inside the snapshot directory the rename call will return "access
++		// denied" or "file is being used by another process" errors.  Just
++		// returning that error causes the entire snapshot garbage collection
++		// operation to fail. To avoid that we return failed pre-condition error
++		// here so that snapshot garbage collection can continue and can cleanup
++		// other snapshots.
++		return fmt.Errorf("%w: %s", errdefs.ErrFailedPrecondition, err.Error())
+ 	}
+ 
+ 	if err := t.Commit(); err != nil {
+diff --git a/snapshots/windows/windows.go b/snapshots/windows/windows.go
+index 820f9858f..4d9af0e66 100644
+--- a/snapshots/windows/windows.go
++++ b/snapshots/windows/windows.go
+@@ -32,6 +32,7 @@ import (
+ 
+ 	"github.com/Microsoft/go-winio"
+ 	winfs "github.com/Microsoft/go-winio/pkg/fs"
++	"github.com/Microsoft/go-winio/vhd"
+ 	"github.com/Microsoft/hcsshim"
+ 	"github.com/Microsoft/hcsshim/computestorage"
+ 	"github.com/Microsoft/hcsshim/pkg/ociwclayer"
+@@ -251,25 +252,25 @@ func (s *snapshotter) Remove(ctx context.Context, key string) error {
+ 	renamedID := "rm-" + id
+ 	renamed := s.getSnapshotDir(renamedID)
+ 	if err := os.Rename(path, renamed); err != nil && !os.IsNotExist(err) {
+-		if !os.IsPermission(err) {
+-			return err
+-		}
+-		// If permission denied, it's possible that the scratch is still mounted, an
+-		// artifact after a hard daemon crash for example. Worth a shot to try deactivating it
+-		// before retrying the rename.
+-		var (
+-			home, layerID = filepath.Split(path)
+-			di            = hcsshim.DriverInfo{
+-				HomeDir: home,
++		// Sometimes if there are some open handles to the files (especially VHD)
++		// inside the snapshot directory the rename call will return "access
++		// denied" or "file is being used by another process" errors.  Just
++		// returning that error causes the entire snapshot garbage collection
++		// operation to fail. To avoid that we return failed pre-condition error
++		// here so that snapshot garbage collection can continue and can cleanup
++		// other snapshots.
++		if os.IsPermission(err) {
++			// If permission denied, it's possible that the scratch is still mounted, an
++			// artifact after a hard daemon crash for example. Worth a shot to try detaching it
++			// before retrying the rename.
++			if detachErr := vhd.DetachVhd(filepath.Join(path, "sandbox.vhdx")); detachErr != nil {
++				return fmt.Errorf("%w: failed to detach vhd during snapshot cleanup %s: %s", errdefs.ErrFailedPrecondition, detachErr.Error(), err)
+ 			}
+-		)
+-
+-		if deactivateErr := hcsshim.DeactivateLayer(di, layerID); deactivateErr != nil {
+-			return fmt.Errorf("failed to deactivate layer following failed rename: %s: %w", deactivateErr, err)
+-		}
+-
+-		if renameErr := os.Rename(path, renamed); renameErr != nil && !os.IsNotExist(renameErr) {
+-			return fmt.Errorf("second rename attempt following detach failed: %s: %w", renameErr, err)
++			if renameErr := os.Rename(path, renamed); renameErr != nil && !os.IsNotExist(renameErr) {
++				return fmt.Errorf("%w: second rename attempt failed  %s: %s", errdefs.ErrFailedPrecondition, renameErr.Error(), err)
++			}
++		} else {
++			return fmt.Errorf("%w: %s", errdefs.ErrFailedPrecondition, err.Error())
+ 		}
+ 	}
+ 

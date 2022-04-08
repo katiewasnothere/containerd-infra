@@ -1,0 +1,2062 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ambarve <57150885+ambarve@users.noreply.github.com>
+Date: Mon, 22 Nov 2021 10:53:06 -0800
+Subject: [PATCH] Unify windows snapshotters & add support to store scratch
+ layers in different directory (#27)
+
+* Refactor windows snapshotters
+
+Both LCOW & WCOW snapshotters have many functions that are identical and some other
+functions have common code. This change refactors those snapshotters to remove duplicate
+code.
+This refactor will also help when adding other features like storing scratch snapshots in a
+different location.
+
+* Support to override scratch snapshot location
+
+Some containers do heavy IO to the scratch, in case of LCOW/WCOW the scratch itself is a
+VHD that is stored on the same disk as that of other snapshots (including the image
+layers). If containerd is pulling multiple images and one or more containers are doing
+heavy IO to the scratch at the same time, that causes disk contention and related
+issues. This change allows the user to set a config (either in containerd.toml or in the
+container configuration) that specifies another directory inside which the scratch of all
+containers (or that specific container) should be stored.
+
+Signed-off-by: Amit Barve <ambarve@microsoft.com>
+---
+ cmd/containerd/builtins_windows.go |   2 +-
+ snapshots/lcow/lcow.go             | 477 +-----------------------
+ snapshots/wcow/wcow.go             |  35 ++
+ snapshots/windows/common.go        | 356 ++++++++++++++++++
+ snapshots/windows/lcow.go          | 310 ++++++++++++++++
+ snapshots/windows/wcow.go          | 221 ++++++++++++
+ snapshots/windows/windows.go       | 558 -----------------------------
+ 7 files changed, 928 insertions(+), 1031 deletions(-)
+ create mode 100644 snapshots/wcow/wcow.go
+ create mode 100644 snapshots/windows/common.go
+ create mode 100644 snapshots/windows/lcow.go
+ create mode 100644 snapshots/windows/wcow.go
+ delete mode 100644 snapshots/windows/windows.go
+
+diff --git a/cmd/containerd/builtins_windows.go b/cmd/containerd/builtins_windows.go
+index 8861ca3c8..3772c2cea 100644
+--- a/cmd/containerd/builtins_windows.go
++++ b/cmd/containerd/builtins_windows.go
+@@ -20,5 +20,5 @@ import (
+ 	_ "github.com/containerd/containerd/diff/lcow"
+ 	_ "github.com/containerd/containerd/diff/windows"
+ 	_ "github.com/containerd/containerd/snapshots/lcow"
+-	_ "github.com/containerd/containerd/snapshots/windows"
++	_ "github.com/containerd/containerd/snapshots/wcow"
+ )
+diff --git a/snapshots/lcow/lcow.go b/snapshots/lcow/lcow.go
+index 35091c6d1..c459aea27 100644
+--- a/snapshots/lcow/lcow.go
++++ b/snapshots/lcow/lcow.go
+@@ -20,491 +20,24 @@
+ package lcow
+ 
+ import (
+-	"context"
+-	"encoding/json"
+-	"fmt"
+-	"io"
+-	"os"
+-	"path/filepath"
+ 	"runtime"
+-	"strconv"
+-	"strings"
+-	"sync"
+-	"time"
+ 
+-	winfs "github.com/Microsoft/go-winio/pkg/fs"
+-	"github.com/Microsoft/hcsshim/pkg/go-runhcs"
+-	"github.com/containerd/containerd/errdefs"
+-	"github.com/containerd/containerd/log"
+-	"github.com/containerd/containerd/mount"
+ 	"github.com/containerd/containerd/plugin"
+-	"github.com/containerd/containerd/snapshots"
+-	"github.com/containerd/containerd/snapshots/storage"
+-	"github.com/containerd/continuity/fs"
++	"github.com/containerd/containerd/snapshots/windows"
+ 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+ )
+ 
+ func init() {
+ 	plugin.Register(&plugin.Registration{
+-		Type: plugin.SnapshotPlugin,
+-		ID:   "windows-lcow",
++		Type:   plugin.SnapshotPlugin,
++		ID:     "windows-lcow",
++		Config: &windows.WindowsSnapshotterConfig{},
+ 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+ 			ic.Meta.Platforms = append(ic.Meta.Platforms, ocispec.Platform{
+ 				OS:           "linux",
+ 				Architecture: runtime.GOARCH,
+ 			})
+-			return NewSnapshotter(ic.Root)
++			return windows.NewLCOWSnapshotter(ic)
+ 		},
+ 	})
+ }
+-
+-const (
+-	rootfsSizeLabel           = "containerd.io/snapshot/io.microsoft.container.storage.rootfs.size-gb"
+-	rootfsLocLabel            = "containerd.io/snapshot/io.microsoft.container.storage.rootfs.location"
+-	reuseScratchLabel         = "containerd.io/snapshot/io.microsoft.container.storage.reuse-scratch"
+-	reuseScratchOwnerKeyLabel = "containerd.io/snapshot/io.microsoft.owner.key"
+-)
+-
+-type snapshotter struct {
+-	root string
+-	ms   *storage.MetaStore
+-
+-	scratchLock sync.Mutex
+-}
+-
+-// NewSnapshotter returns a new windows snapshotter
+-func NewSnapshotter(root string) (snapshots.Snapshotter, error) {
+-	fsType, err := winfs.GetFileSystemType(root)
+-	if err != nil {
+-		return nil, err
+-	}
+-	if strings.ToLower(fsType) != "ntfs" {
+-		return nil, fmt.Errorf("%s is not on an NTFS volume - only NTFS volumes are supported: %w", root, errdefs.ErrInvalidArgument)
+-	}
+-
+-	if err := os.MkdirAll(root, 0700); err != nil {
+-		return nil, err
+-	}
+-	ms, err := storage.NewMetaStore(filepath.Join(root, "metadata.db"))
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
+-		return nil, err
+-	}
+-
+-	return &snapshotter{
+-		root: root,
+-		ms:   ms,
+-	}, nil
+-}
+-
+-// Stat returns the info for an active or committed snapshot by name or
+-// key.
+-//
+-// Should be used for parent resolution, existence checks and to discern
+-// the kind of snapshot.
+-func (s *snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, false)
+-	if err != nil {
+-		return snapshots.Info{}, err
+-	}
+-	defer t.Rollback()
+-
+-	_, info, _, err := storage.GetInfo(ctx, key)
+-	return info, err
+-}
+-
+-func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (snapshots.Info, error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, true)
+-	if err != nil {
+-		return snapshots.Info{}, err
+-	}
+-	defer t.Rollback()
+-
+-	info, err = storage.UpdateInfo(ctx, info, fieldpaths...)
+-	if err != nil {
+-		return snapshots.Info{}, err
+-	}
+-
+-	if err := t.Commit(); err != nil {
+-		return snapshots.Info{}, err
+-	}
+-
+-	return info, nil
+-}
+-
+-func (s *snapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, false)
+-	if err != nil {
+-		return snapshots.Usage{}, err
+-	}
+-	id, info, usage, err := storage.GetInfo(ctx, key)
+-	t.Rollback() // transaction no longer needed at this point.
+-
+-	if err != nil {
+-		return snapshots.Usage{}, err
+-	}
+-
+-	if info.Kind == snapshots.KindActive {
+-		du, err := fs.DiskUsage(ctx, s.getSnapshotDir(id))
+-		if err != nil {
+-			return snapshots.Usage{}, err
+-		}
+-		usage = snapshots.Usage(du)
+-	}
+-
+-	return usage, nil
+-}
+-
+-func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+-	return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+-}
+-
+-func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+-	return s.createSnapshot(ctx, snapshots.KindView, key, parent, opts)
+-}
+-
+-// Mounts returns the mounts for the transaction identified by key. Can be
+-// called on an read-write or readonly transaction.
+-//
+-// This can be used to recover mounts after calling View or Prepare.
+-func (s *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, false)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer t.Rollback()
+-
+-	snapshot, err := storage.GetSnapshot(ctx, key)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to get snapshot mount: %w", err)
+-	}
+-	return s.mounts(snapshot), nil
+-}
+-
+-func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
+-	ctx, t, err := s.ms.TransactionContext(ctx, true)
+-	if err != nil {
+-		return err
+-	}
+-	defer func() {
+-		if err != nil {
+-			if rerr := t.Rollback(); rerr != nil {
+-				log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
+-			}
+-		}
+-	}()
+-
+-	// grab the existing id
+-	id, _, _, err := storage.GetInfo(ctx, key)
+-	if err != nil {
+-		return err
+-	}
+-
+-	usage, err := fs.DiskUsage(ctx, s.getSnapshotDir(id))
+-	if err != nil {
+-		return err
+-	}
+-
+-	if _, err = storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
+-		return fmt.Errorf("failed to commit snapshot: %w", err)
+-	}
+-
+-	return t.Commit()
+-}
+-
+-// Remove abandons the transaction identified by key. All resources
+-// associated with the key will be removed.
+-func (s *snapshotter) Remove(ctx context.Context, key string) error {
+-	ctx, t, err := s.ms.TransactionContext(ctx, true)
+-	if err != nil {
+-		return err
+-	}
+-	defer t.Rollback()
+-
+-	id, _, err := storage.Remove(ctx, key)
+-	if err != nil {
+-		return fmt.Errorf("failed to remove: %w", err)
+-	}
+-
+-	path := s.getSnapshotDir(id)
+-	renamed := s.getSnapshotDir("rm-" + id)
+-	if err := os.Rename(path, renamed); err != nil && !os.IsNotExist(err) {
+-		// Sometimes if there are some open handles to the files (especially VHD)
+-		// inside the snapshot directory the rename call will return "access
+-		// denied" or "file is being used by another process" errors.  Just
+-		// returning that error causes the entire snapshot garbage collection
+-		// operation to fail. To avoid that we return failed pre-condition error
+-		// here so that snapshot garbage collection can continue and can cleanup
+-		// other snapshots.
+-		return fmt.Errorf("%w: %s", errdefs.ErrFailedPrecondition, err.Error())
+-	}
+-
+-	if err := t.Commit(); err != nil {
+-		if err1 := os.Rename(renamed, path); err1 != nil {
+-			// May cause inconsistent data on disk
+-			log.G(ctx).WithError(err1).WithField("path", renamed).Error("Failed to rename after failed commit")
+-		}
+-		return fmt.Errorf("failed to commit: %w", err)
+-	}
+-
+-	if err := os.RemoveAll(renamed); err != nil {
+-		// Must be cleaned up, any "rm-*" could be removed if no active transactions
+-		log.G(ctx).WithError(err).WithField("path", renamed).Warnf("Failed to remove root filesystem")
+-	}
+-
+-	return nil
+-}
+-
+-// Walk the committed snapshots.
+-func (s *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
+-	ctx, t, err := s.ms.TransactionContext(ctx, false)
+-	if err != nil {
+-		return err
+-	}
+-	defer t.Rollback()
+-
+-	return storage.WalkInfo(ctx, fn, fs...)
+-}
+-
+-// Close closes the snapshotter
+-func (s *snapshotter) Close() error {
+-	return s.ms.Close()
+-}
+-
+-func (s *snapshotter) mounts(sn storage.Snapshot) []mount.Mount {
+-	var (
+-		roFlag           string
+-		source           string
+-		parentLayerPaths []string
+-	)
+-
+-	if sn.Kind == snapshots.KindView {
+-		roFlag = "ro"
+-	} else {
+-		roFlag = "rw"
+-	}
+-
+-	if len(sn.ParentIDs) == 0 || sn.Kind == snapshots.KindActive {
+-		source = s.getSnapshotDir(sn.ID)
+-		parentLayerPaths = s.parentIDsToParentPaths(sn.ParentIDs)
+-	} else {
+-		source = s.getSnapshotDir(sn.ParentIDs[0])
+-		parentLayerPaths = s.parentIDsToParentPaths(sn.ParentIDs[1:])
+-	}
+-
+-	// error is not checked here, as a string array will never fail to Marshal
+-	parentLayersJSON, _ := json.Marshal(parentLayerPaths)
+-	parentLayersOption := mount.ParentLayerPathsFlag + string(parentLayersJSON)
+-
+-	var mounts []mount.Mount
+-	mounts = append(mounts, mount.Mount{
+-		Source: source,
+-		Type:   "lcow-layer",
+-		Options: []string{
+-			roFlag,
+-			parentLayersOption,
+-		},
+-	})
+-
+-	return mounts
+-}
+-
+-func (s *snapshotter) getSnapshotDir(id string) string {
+-	return filepath.Join(s.root, "snapshots", id)
+-}
+-
+-func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, true)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer t.Rollback()
+-
+-	newSnapshot, err := storage.CreateSnapshot(ctx, kind, key, parent, opts...)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to create snapshot: %w", err)
+-	}
+-
+-	if kind == snapshots.KindActive {
+-		log.G(ctx).Debug("createSnapshot active")
+-		// Create the new snapshot dir
+-		snDir := s.getSnapshotDir(newSnapshot.ID)
+-		if err := os.MkdirAll(snDir, 0700); err != nil {
+-			return nil, err
+-		}
+-
+-		var snapshotInfo snapshots.Info
+-		for _, o := range opts {
+-			o(&snapshotInfo)
+-		}
+-
+-		defer func() {
+-			if err != nil {
+-				os.RemoveAll(snDir)
+-			}
+-		}()
+-
+-		// IO/disk space optimization
+-		//
+-		// We only need one sandbox.vhd for the container. Skip making one for this
+-		// snapshot if this isn't the snapshot that just houses the final sandbox.vhd
+-		// that will be mounted as the containers scratch. The key for a snapshot
+-		// where a layer.vhd will be extracted to it will have the substring `extract-` in it.
+-		// If this is changed this will also need to be changed.
+-		//
+-		// We save about 17MB per layer (if the default scratch vhd size of 20GB is used) and of
+-		// course the time to copy the vhdx per snapshot.
+-		if !strings.Contains(key, snapshots.UnpackKeyPrefix) {
+-			// This is the code path that handles re-using a scratch disk that has already been
+-			// made/mounted for an LCOW UVM. In the non sharing case, we create a new disk and mount this
+-			// into the LCOW UVM for every container but there are certain scenarios where we'd rather
+-			// just mount a single disk and then have every container share this one storage space instead of
+-			// every container having it's own xGB of space to play around with.
+-			//
+-			// This is accomplished by just making a symlink to the disk that we'd like to share and then
+-			// using ref counting later on down the stack in hcsshim if we see that we've already mounted this
+-			// disk.
+-			shareScratch := snapshotInfo.Labels[reuseScratchLabel]
+-			ownerKey := snapshotInfo.Labels[reuseScratchOwnerKeyLabel]
+-			if shareScratch == "true" && ownerKey != "" {
+-				if err = s.handleSharing(ctx, ownerKey, snDir); err != nil {
+-					return nil, err
+-				}
+-			} else {
+-				var sizeGB int
+-				if sizeGBstr, ok := snapshotInfo.Labels[rootfsSizeLabel]; ok {
+-					i64, _ := strconv.ParseInt(sizeGBstr, 10, 32)
+-					sizeGB = int(i64)
+-				}
+-
+-				scratchLocation := snapshotInfo.Labels[rootfsLocLabel]
+-				scratchSource, err := s.openOrCreateScratch(ctx, sizeGB, scratchLocation)
+-				if err != nil {
+-					return nil, err
+-				}
+-				defer scratchSource.Close()
+-
+-				// Create the sandbox.vhdx for this snapshot from the cache
+-				destPath := filepath.Join(snDir, "sandbox.vhdx")
+-				dest, err := os.OpenFile(destPath, os.O_RDWR|os.O_CREATE, 0700)
+-				if err != nil {
+-					return nil, fmt.Errorf("failed to create sandbox.vhdx in snapshot: %w", err)
+-				}
+-				defer dest.Close()
+-				if _, err := io.Copy(dest, scratchSource); err != nil {
+-					dest.Close()
+-					os.Remove(destPath)
+-					return nil, fmt.Errorf("failed to copy cached scratch.vhdx to sandbox.vhdx in snapshot: %w", err)
+-				}
+-			}
+-		}
+-	}
+-
+-	if err := t.Commit(); err != nil {
+-		return nil, fmt.Errorf("commit failed: %w", err)
+-	}
+-
+-	return s.mounts(newSnapshot), nil
+-}
+-
+-func (s *snapshotter) handleSharing(ctx context.Context, id, snDir string) error {
+-	var key string
+-	if err := s.Walk(ctx, func(ctx context.Context, info snapshots.Info) error {
+-		if strings.Contains(info.Name, id) {
+-			key = info.Name
+-		}
+-		return nil
+-	}); err != nil {
+-		return err
+-	}
+-
+-	mounts, err := s.Mounts(ctx, key)
+-	if err != nil {
+-		return fmt.Errorf("failed to get mounts for owner snapshot: %w", err)
+-	}
+-
+-	sandboxPath := filepath.Join(mounts[0].Source, "sandbox.vhdx")
+-	linkPath := filepath.Join(snDir, "sandbox.vhdx")
+-	if _, err := os.Stat(sandboxPath); err != nil {
+-		return fmt.Errorf("failed to find sandbox.vhdx in snapshot directory: %w", err)
+-	}
+-
+-	// We've found everything we need, now just make a symlink in our new snapshot to the
+-	// sandbox.vhdx in the scratch we're asking to share.
+-	if err := os.Symlink(sandboxPath, linkPath); err != nil {
+-		return fmt.Errorf("failed to create symlink for sandbox scratch space: %w", err)
+-	}
+-	return nil
+-}
+-
+-func (s *snapshotter) openOrCreateScratch(ctx context.Context, sizeGB int, scratchLoc string) (_ *os.File, err error) {
+-	// Create the scratch.vhdx cache file if it doesn't already exit.
+-	s.scratchLock.Lock()
+-	defer s.scratchLock.Unlock()
+-
+-	vhdFileName := "scratch.vhdx"
+-	if sizeGB > 0 {
+-		vhdFileName = fmt.Sprintf("scratch_%d.vhdx", sizeGB)
+-	}
+-
+-	scratchFinalPath := filepath.Join(s.root, vhdFileName)
+-	if scratchLoc != "" {
+-		scratchFinalPath = filepath.Join(scratchLoc, vhdFileName)
+-	}
+-
+-	scratchSource, err := os.OpenFile(scratchFinalPath, os.O_RDONLY, 0700)
+-	if err != nil {
+-		if !os.IsNotExist(err) {
+-			return nil, fmt.Errorf("failed to open vhd %s for read: %w", vhdFileName, err)
+-		}
+-
+-		log.G(ctx).Debugf("vhdx %s not found, creating a new one", vhdFileName)
+-
+-		// Golang logic for ioutil.TempFile without the file creation
+-		r := uint32(time.Now().UnixNano() + int64(os.Getpid()))
+-		r = r*1664525 + 1013904223 // constants from Numerical Recipes
+-
+-		scratchTempName := fmt.Sprintf("scratch-%s-tmp.vhdx", strconv.Itoa(int(1e9 + r%1e9))[1:])
+-		scratchTempPath := filepath.Join(s.root, scratchTempName)
+-
+-		// Create the scratch
+-		rhcs := runhcs.Runhcs{
+-			Debug:     true,
+-			Log:       filepath.Join(s.root, "runhcs-scratch.log"),
+-			LogFormat: runhcs.JSON,
+-			Owner:     "containerd",
+-		}
+-
+-		opt := runhcs.CreateScratchOpts{
+-			SizeGB: sizeGB,
+-		}
+-
+-		if err := rhcs.CreateScratchWithOpts(ctx, scratchTempPath, &opt); err != nil {
+-			os.Remove(scratchTempPath)
+-			return nil, fmt.Errorf("failed to create '%s' temp file: %w", scratchTempName, err)
+-		}
+-		if err := os.Rename(scratchTempPath, scratchFinalPath); err != nil {
+-			os.Remove(scratchTempPath)
+-			return nil, fmt.Errorf("failed to rename '%s' temp file to 'scratch.vhdx': %w", scratchTempName, err)
+-		}
+-		scratchSource, err = os.OpenFile(scratchFinalPath, os.O_RDONLY, 0700)
+-		if err != nil {
+-			os.Remove(scratchFinalPath)
+-			return nil, fmt.Errorf("failed to open scratch.vhdx for read after creation: %w", err)
+-		}
+-	} else {
+-		log.G(ctx).Debugf("scratch vhd %s was already present. Retrieved from cache", vhdFileName)
+-	}
+-	return scratchSource, nil
+-}
+-
+-func (s *snapshotter) parentIDsToParentPaths(parentIDs []string) []string {
+-	var parentLayerPaths []string
+-	for _, ID := range parentIDs {
+-		parentLayerPaths = append(parentLayerPaths, s.getSnapshotDir(ID))
+-	}
+-	return parentLayerPaths
+-}
+diff --git a/snapshots/wcow/wcow.go b/snapshots/wcow/wcow.go
+new file mode 100644
+index 000000000..cae9a7b9b
+--- /dev/null
++++ b/snapshots/wcow/wcow.go
+@@ -0,0 +1,35 @@
++// +build windows
++
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package wcow
++
++import (
++	"github.com/containerd/containerd/plugin"
++	"github.com/containerd/containerd/snapshots/windows"
++)
++
++func init() {
++	plugin.Register(&plugin.Registration{
++		Type:   plugin.SnapshotPlugin,
++		ID:     "windows",
++		Config: &windows.WindowsSnapshotterConfig{},
++		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
++			return windows.NewWCOWSnapshotter(ic)
++		},
++	})
++}
+diff --git a/snapshots/windows/common.go b/snapshots/windows/common.go
+new file mode 100644
+index 000000000..f9b92fa2c
+--- /dev/null
++++ b/snapshots/windows/common.go
+@@ -0,0 +1,356 @@
++// +build windows
++
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package windows
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++
++	winfs "github.com/Microsoft/go-winio/pkg/fs"
++	"github.com/containerd/containerd/errdefs"
++	"github.com/containerd/containerd/log"
++	"github.com/containerd/containerd/mount"
++	"github.com/containerd/containerd/snapshots"
++	"github.com/containerd/containerd/snapshots/storage"
++	"github.com/containerd/continuity/fs"
++	"github.com/pkg/errors"
++	"github.com/sirupsen/logrus"
++)
++
++const (
++	rootfsSizeLabel           = "containerd.io/snapshot/io.microsoft.container.storage.rootfs.size-gb"
++	reuseScratchLabel         = "containerd.io/snapshot/io.microsoft.container.storage.reuse-scratch"
++	reuseScratchOwnerKeyLabel = "containerd.io/snapshot/io.microsoft.owner.key"
++	// labelScratchSnapshotLocation is a label provided in snapshotter opts to specify
++	// if the scratch snapshot should be stored in a different location specified by
++	// this annotations. (Only supported on windows & lcow snapshotter as of now)
++	labelScratchSnapshotLocation = "containerd.io/snapshot/io.microsoft.override-scratch"
++)
++
++// windowsSnapshotterBase is the base snapshotter for both LCOW & WCOW snapshotters. It provides common
++// methods required for both snapshotters.
++type windowsSnapshotterBase struct {
++	root     string
++	ms       *storage.MetaStore
++	snConfig *WindowsSnapshotterConfig
++}
++
++// WindowsSnapshotterConfig is the configuration related to windows snapshotters (i.e LCOW & WCOW)
++type WindowsSnapshotterConfig struct {
++	// SnapshotterScratchLocation is the path on the host at which all the container
++	// scratch snapshots should be stored. This is useful in cases when we need to
++	// keep the scratch layers on a different volume/disk than the image layers
++	SnapshotterScratchLocation string `toml:"snapshotter_scratch_location" json:"snapshotterScratchLocation"`
++}
++
++// NewSnapshotter returns a new windows snapshotter
++func newWindowsSnapshotter(root string, snConfig *WindowsSnapshotterConfig) (*windowsSnapshotterBase, error) {
++	fsType, err := winfs.GetFileSystemType(root)
++	if err != nil {
++		return nil, err
++	}
++	if strings.ToLower(fsType) != "ntfs" {
++		return nil, errors.Wrapf(errdefs.ErrInvalidArgument, "%s is not on an NTFS volume - only NTFS volumes are supported", root)
++	}
++
++	if err := os.MkdirAll(root, 0700); err != nil {
++		return nil, err
++	}
++	ms, err := storage.NewMetaStore(filepath.Join(root, "metadata.db"))
++	if err != nil {
++		return nil, err
++	}
++
++	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
++		return nil, err
++	}
++
++	return &windowsSnapshotterBase{
++		root:     root,
++		ms:       ms,
++		snConfig: snConfig,
++	}, nil
++}
++
++// Stat returns the info for an active or committed snapshot by name or
++// key.
++//
++// Should be used for parent resolution, existence checks and to discern
++// the kind of snapshot.
++func (s *windowsSnapshotterBase) Stat(ctx context.Context, key string) (snapshots.Info, error) {
++	ctx, t, err := s.ms.TransactionContext(ctx, false)
++	if err != nil {
++		return snapshots.Info{}, err
++	}
++	defer t.Rollback()
++
++	_, info, _, err := storage.GetInfo(ctx, key)
++	return info, err
++}
++
++func (s *windowsSnapshotterBase) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (snapshots.Info, error) {
++	ctx, t, err := s.ms.TransactionContext(ctx, true)
++	if err != nil {
++		return snapshots.Info{}, err
++	}
++	defer t.Rollback()
++
++	info, err = storage.UpdateInfo(ctx, info, fieldpaths...)
++	if err != nil {
++		return snapshots.Info{}, err
++	}
++
++	if err := t.Commit(); err != nil {
++		return snapshots.Info{}, err
++	}
++
++	return info, nil
++}
++
++func (s *windowsSnapshotterBase) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
++	ctx, t, err := s.ms.TransactionContext(ctx, false)
++	if err != nil {
++		return snapshots.Usage{}, err
++	}
++	id, info, usage, err := storage.GetInfo(ctx, key)
++	t.Rollback() // transaction no longer needed at this point.
++
++	if err != nil {
++		return snapshots.Usage{}, err
++	}
++
++	if info.Kind == snapshots.KindActive {
++		path := s.getResolvedSnapshotDir(id, info)
++		du, err := fs.DiskUsage(ctx, path)
++		if err != nil {
++			return snapshots.Usage{}, err
++		}
++
++		usage = snapshots.Usage(du)
++	}
++
++	return usage, nil
++}
++
++func (s *windowsSnapshotterBase) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
++	ctx, t, err := s.ms.TransactionContext(ctx, true)
++	if err != nil {
++		return err
++	}
++
++	defer func() {
++		if err != nil {
++			if rerr := t.Rollback(); rerr != nil {
++				log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
++			}
++		}
++	}()
++
++	// grab the existing id
++	id, info, _, err := storage.GetInfo(ctx, key)
++	if err != nil {
++		return err
++	}
++
++	usage, err := fs.DiskUsage(ctx, s.getResolvedSnapshotDir(id, info))
++	if err != nil {
++		return err
++	}
++
++	if _, err = storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
++		return errors.Wrap(err, "failed to commit snapshot")
++	}
++	return t.Commit()
++}
++
++// Walk the committed snapshots.
++func (s *windowsSnapshotterBase) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
++	ctx, t, err := s.ms.TransactionContext(ctx, false)
++	if err != nil {
++		return err
++	}
++	defer t.Rollback()
++
++	return storage.WalkInfo(ctx, fn, fs...)
++}
++
++// Close closes the snapshotter
++func (s *windowsSnapshotterBase) Close() error {
++	return s.ms.Close()
++}
++
++func (s *windowsSnapshotterBase) mounts(sn storage.Snapshot) []mount.Mount {
++	var (
++		roFlag           string
++		source           string
++		parentLayerPaths []string
++	)
++
++	if sn.Kind == snapshots.KindView {
++		roFlag = "ro"
++	} else {
++		roFlag = "rw"
++	}
++
++	if len(sn.ParentIDs) == 0 || sn.Kind == snapshots.KindActive {
++		source = s.getSnapshotDir(sn.ID)
++		parentLayerPaths = s.parentIDsToParentPaths(sn.ParentIDs)
++	} else {
++		source = s.getSnapshotDir(sn.ParentIDs[0])
++		parentLayerPaths = s.parentIDsToParentPaths(sn.ParentIDs[1:])
++	}
++
++	// error is not checked here, as a string array will never fail to Marshal
++	parentLayersJSON, _ := json.Marshal(parentLayerPaths)
++	parentLayersOption := mount.ParentLayerPathsFlag + string(parentLayersJSON)
++
++	var mounts []mount.Mount
++	mounts = append(mounts, mount.Mount{
++		Source: source,
++		Options: []string{
++			roFlag,
++			parentLayersOption,
++		},
++	})
++
++	return mounts
++}
++
++func (s *windowsSnapshotterBase) getSnapshotDir(id string) string {
++	return filepath.Join(s.root, "snapshots", id)
++}
++
++func (s *windowsSnapshotterBase) getResolvedSnapshotDir(id string, snInfo snapshots.Info) string {
++	scratchDir, ok := snInfo.Labels[labelScratchSnapshotLocation]
++	if ok {
++		return filepath.Join(scratchDir, id)
++	}
++	return s.getSnapshotDir(id)
++}
++
++func (s *windowsSnapshotterBase) parentIDsToParentPaths(parentIDs []string) []string {
++	var parentLayerPaths []string
++	for _, ID := range parentIDs {
++		parentLayerPaths = append(parentLayerPaths, s.getSnapshotDir(ID))
++	}
++	return parentLayerPaths
++}
++
++// OnErrorDirectoryCleanup removes the directories if given error is nil (i.e *err == nil)
++// logs any errors if any.
++func onErrorDirectoryCleanup(ctx context.Context, err *error, dirPaths ...string) {
++	if *err != nil {
++		for _, dirPath := range dirPaths {
++			if removeErr := os.Remove(dirPath); removeErr != nil && !os.IsNotExist(removeErr) {
++				log.G(ctx).WithFields(logrus.Fields{
++					"cleanupDir":    dirPath,
++					"originalError": *err,
++					"cleanupError":  removeErr,
++				}).Warn("error while cleaning up after failure")
++			}
++		}
++	}
++}
++
++// createSnapshotCommon creates a snapshot in the metadata db with the correct snapshot info.
++// It also creates a directory for this snapshot if this is an Active snapshot.
++// The context must be a transaction context.
++func (s *windowsSnapshotterBase) createSnapshotCommon(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ storage.Snapshot, _ snapshots.Info, err error) {
++	newSnapshot, err := storage.CreateSnapshot(ctx, kind, key, parent, opts...)
++	if err != nil {
++		return storage.Snapshot{}, snapshots.Info{}, errors.Wrap(err, "failed to create snapshot")
++	}
++
++	// The snapshot scratch override location could be specified in the containerd.toml or it could
++	// be specified in the container config. The one specified in the container config takes preference.
++	// Get the correct override location, update that in the snapshot snapshotInfo and save it so that all other
++	// operations will use the correct path.
++	_, snapshotInfo, _, err := storage.GetInfo(ctx, key)
++	if err != nil {
++		return storage.Snapshot{}, snapshots.Info{}, errors.Wrap(err, "failed to get snapshot info")
++	}
++
++	_, ok := snapshotInfo.Labels[labelScratchSnapshotLocation]
++	if !ok && !strings.Contains(key, snapshots.UnpackKeyPrefix) {
++		// no label provided in container config and this is a scratch snapshot
++		if s.snConfig.SnapshotterScratchLocation != "" {
++			if snapshotInfo.Labels == nil {
++				snapshotInfo.Labels = make(map[string]string)
++			}
++			snapshotInfo.Labels[labelScratchSnapshotLocation] = s.snConfig.SnapshotterScratchLocation
++			snapshotInfo, err = storage.UpdateInfo(ctx, snapshotInfo)
++			if err != nil {
++				errors.Wrap(err, "failed to write updated info")
++			}
++		}
++	}
++
++	if kind == snapshots.KindActive {
++		log.G(ctx).Debug("createSnapshot active")
++
++		// Create the new snapshot dir
++		_, _, err := s.createSnapshotDirectory(ctx, snapshotInfo, key, newSnapshot.ID)
++		if err != nil {
++			return storage.Snapshot{}, snapshots.Info{}, errors.Wrap(err, "failed to create snapshot directory")
++		}
++	}
++
++	return newSnapshot, snapshotInfo, nil
++}
++
++// createSnapshotDirectory creates a directory for the snapshot by correctly handling the
++// annotations / configs provided for overriding the location where scratch snapshots
++// should be stored.
++func (s *windowsSnapshotterBase) createSnapshotDirectory(ctx context.Context, snInfo snapshots.Info, snKey, snID string) (_, _ string, err error) {
++	snDir := s.getSnapshotDir(snID)
++
++	// create all parent directories first
++	if err = os.MkdirAll(filepath.Dir(snDir), 0700); err != nil {
++		return "", "", err
++	}
++
++	// Check if a different path was provided for scratch
++	snActualDir := s.getResolvedSnapshotDir(snID, snInfo)
++	if snActualDir != snDir && !strings.Contains(snKey, snapshots.UnpackKeyPrefix) {
++		// Create the new snapshot dir at given path
++		log.G(ctx).WithFields(logrus.Fields{
++			"snID":           snID,
++			"snOverridePath": snActualDir,
++		}).Debug("overriding scratch snapshot location")
++
++		if err = os.Mkdir(snActualDir, 0700); err != nil {
++			return "", "", err
++		}
++		defer onErrorDirectoryCleanup(ctx, &err, snActualDir)
++
++		// create a link to the actual snDir in s.root/snapshots directory
++		if err = os.Symlink(snActualDir, snDir); err != nil {
++			return "", "", err
++		}
++	} else {
++		// Create the new snapshot dir
++		if err = os.Mkdir(snDir, 0700); err != nil {
++			return "", "", err
++		}
++	}
++	return snDir, snActualDir, nil
++}
+diff --git a/snapshots/windows/lcow.go b/snapshots/windows/lcow.go
+new file mode 100644
+index 000000000..faf98d67d
+--- /dev/null
++++ b/snapshots/windows/lcow.go
+@@ -0,0 +1,310 @@
++// +build windows
++
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package windows
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/Microsoft/hcsshim/pkg/go-runhcs"
++	"github.com/containerd/containerd/errdefs"
++	"github.com/containerd/containerd/log"
++	"github.com/containerd/containerd/mount"
++	"github.com/containerd/containerd/plugin"
++	"github.com/containerd/containerd/snapshots"
++	"github.com/containerd/containerd/snapshots/storage"
++	"github.com/pkg/errors"
++)
++
++type lcowSnapshotter struct {
++	*windowsSnapshotterBase
++	scratchLock sync.Mutex
++}
++
++// NewSnapshotter returns a new windows snapshotter
++func NewLCOWSnapshotter(ic *plugin.InitContext) (snapshots.Snapshotter, error) {
++	ws, err := newWindowsSnapshotter(ic.Root, ic.Config.(*WindowsSnapshotterConfig))
++	if err != nil {
++		return nil, err
++	}
++	return &lcowSnapshotter{
++		windowsSnapshotterBase: ws,
++	}, nil
++}
++
++func (l *lcowSnapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
++	return l.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
++}
++
++func (l *lcowSnapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
++	return l.createSnapshot(ctx, snapshots.KindView, key, parent, opts)
++}
++
++func (l *lcowSnapshotter) lcowMounts(snapshot storage.Snapshot) []mount.Mount {
++	marr := l.mounts(snapshot)
++	for i := range marr {
++		marr[i].Type = "lcow-layer"
++	}
++	return marr
++}
++
++// Mounts returns the mounts for the transaction identified by key. Can be
++// called on an read-write or readonly transaction.
++//
++// This can be used to recover mounts after calling View or Prepare.
++func (l *lcowSnapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, error) {
++	ctx, t, err := l.ms.TransactionContext(ctx, false)
++	if err != nil {
++		return nil, err
++	}
++	defer t.Rollback()
++
++	snapshot, err := storage.GetSnapshot(ctx, key)
++	if err != nil {
++		return nil, errors.Wrap(err, "failed to get snapshot mount")
++	}
++	m := l.lcowMounts(snapshot)
++	return m, nil
++}
++
++// Remove abandons the transaction identified by key. All resources
++// associated with the key will be removed.
++func (l *lcowSnapshotter) Remove(ctx context.Context, key string) error {
++	ctx, t, err := l.ms.TransactionContext(ctx, true)
++	if err != nil {
++		return err
++	}
++	defer t.Rollback()
++
++	id, snInfo, _, err := storage.GetInfo(ctx, key)
++	if err != nil {
++		return errors.Wrapf(errdefs.ErrFailedPrecondition, "failed to get snapshot info: %s", err)
++	}
++
++	_, _, err = storage.Remove(ctx, key)
++	if err != nil {
++		return errors.Wrap(err, "failed to remove")
++	}
++
++	path := l.getSnapshotDir(id)
++	overridePath := l.getResolvedSnapshotDir(id, snInfo)
++	renamed := l.getSnapshotDir("rm-" + id)
++	if err := os.Rename(path, renamed); err != nil && !os.IsNotExist(err) {
++		// Sometimes if there are some open handles to the files (especially VHD)
++		// inside the snapshot directory the rename call will return "access
++		// denied" or "file is being used by another process" errors.  Just
++		// returning that error causes the entire snapshot garbage collection
++		// operation to fail. To avoid that we return failed pre-condition error
++		// here so that snapshot garbage collection can continue and can cleanup
++		// other snapshots.
++		return errors.Wrap(errdefs.ErrFailedPrecondition, err.Error())
++	}
++
++	if err := t.Commit(); err != nil {
++		if err1 := os.Rename(renamed, path); err1 != nil {
++			// May cause inconsistent data on disk
++			log.G(ctx).WithError(err1).WithField("path", renamed).Errorf("Failed to rename after failed commit")
++		}
++		return errors.Wrap(err, "failed to commit")
++	}
++
++	if path != overridePath {
++		if err := os.RemoveAll(overridePath); err != nil {
++			// Must be cleaned up, any "rm-*" could be removed if no active transactions
++			log.G(ctx).WithError(err).WithField("path", overridePath).Warnf("Failed to remove root filesystem")
++		}
++	}
++	if err := os.RemoveAll(renamed); err != nil && !os.IsNotExist(err) {
++		log.G(ctx).WithError(err).Warnf("failed to remove snapshot dir: %s", renamed)
++	}
++
++	return nil
++}
++
++func (l *lcowSnapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
++	ctx, t, err := l.ms.TransactionContext(ctx, true)
++	if err != nil {
++		return nil, err
++	}
++	defer t.Rollback()
++
++	newSnapshot, snapshotInfo, err := l.createSnapshotCommon(ctx, kind, key, parent, opts)
++	if err != nil {
++		return nil, err
++	}
++	defer onErrorDirectoryCleanup(ctx, &err, l.getSnapshotDir(newSnapshot.ID), l.getResolvedSnapshotDir(newSnapshot.ID, snapshotInfo))
++
++	if kind == snapshots.KindActive {
++		// IO/disk space optimization
++		//
++		// We only need one sandbox.vhd for the container. Skip making one for this
++		// snapshot if this isn't the snapshot that just houses the final sandbox.vhd
++		// that will be mounted as the containers scratch. The key for a snapshot
++		// where a layer.vhd will be extracted to it will have the substring `extract-` in it.
++		// If this is changed this will also need to be changed.
++		//
++		// We save about 17MB per layer (if the default scratch vhd size of 20GB is used) and of
++		// course the time to copy the vhdx per snapshot.
++		if !strings.Contains(key, snapshots.UnpackKeyPrefix) {
++			// This is the code path that handles re-using a scratch disk that has already been
++			// made/mounted for an LCOW UVM. In the non sharing case, we create a new disk and mount this
++			// into the LCOW UVM for every container but there are certain scenarios where we'd rather
++			// just mount a single disk and then have every container share this one storage space instead of
++			// every container having it's own xGB of space to play around with.
++			//
++			// This is accomplished by just making a symlink to the disk that we'd like to share and then
++			// using ref counting later on down the stack in hcsshim if we see that we've already mounted this
++			// disk.
++			shareScratch := snapshotInfo.Labels[reuseScratchLabel]
++			ownerKey := snapshotInfo.Labels[reuseScratchOwnerKeyLabel]
++			snDir := l.getSnapshotDir(newSnapshot.ID)
++			if shareScratch == "true" && ownerKey != "" {
++				if err = l.handleSharing(ctx, ownerKey, snDir); err != nil {
++					return nil, err
++				}
++			} else {
++				var sizeGB int
++				if sizeGBstr, ok := snapshotInfo.Labels[rootfsSizeLabel]; ok {
++					i64, _ := strconv.ParseInt(sizeGBstr, 10, 32)
++					sizeGB = int(i64)
++				}
++
++				scratchSource, err := l.openOrCreateScratch(ctx, sizeGB)
++				if err != nil {
++					return nil, err
++				}
++				defer scratchSource.Close()
++
++				// Create the sandbox.vhdx for this snapshot from the cache
++				destPath := filepath.Join(snDir, "sandbox.vhdx")
++				dest, err := os.OpenFile(destPath, os.O_RDWR|os.O_CREATE, 0700)
++				if err != nil {
++					return nil, errors.Wrap(err, "failed to create sandbox.vhdx in snapshot")
++				}
++				defer dest.Close()
++				if _, err := io.Copy(dest, scratchSource); err != nil {
++					dest.Close()
++					os.Remove(destPath)
++					return nil, errors.Wrap(err, "failed to copy cached scratch.vhdx to sandbox.vhdx in snapshot")
++				}
++			}
++		}
++	}
++
++	if err := t.Commit(); err != nil {
++		return nil, errors.Wrap(err, "commit failed")
++	}
++
++	return l.lcowMounts(newSnapshot), nil
++}
++
++func (l *lcowSnapshotter) handleSharing(ctx context.Context, id, snDir string) error {
++	var key string
++	if err := l.Walk(ctx, func(ctx context.Context, info snapshots.Info) error {
++		if strings.Contains(info.Name, id) {
++			key = info.Name
++		}
++		return nil
++	}); err != nil {
++		return err
++	}
++
++	mounts, err := l.Mounts(ctx, key)
++	if err != nil {
++		return errors.Wrap(err, "failed to get mounts for owner snapshot")
++	}
++
++	sandboxPath := filepath.Join(mounts[0].Source, "sandbox.vhdx")
++	linkPath := filepath.Join(snDir, "sandbox.vhdx")
++	if _, err := os.Stat(sandboxPath); err != nil {
++		return errors.Wrap(err, "failed to find sandbox.vhdx in snapshot directory")
++	}
++
++	// We've found everything we need, now just make a symlink in our new snapshot to the
++	// sandbox.vhdx in the scratch we're asking to share.
++	if err := os.Symlink(sandboxPath, linkPath); err != nil {
++		return errors.Wrap(err, "failed to create symlink for sandbox scratch space")
++	}
++	return nil
++}
++
++func (l *lcowSnapshotter) openOrCreateScratch(ctx context.Context, sizeGB int) (_ *os.File, err error) {
++	// Create the scratch.vhdx cache file if it doesn't already exit.
++	l.scratchLock.Lock()
++	defer l.scratchLock.Unlock()
++
++	vhdFileName := "scratch.vhdx"
++	if sizeGB > 0 {
++		vhdFileName = fmt.Sprintf("scratch_%d.vhdx", sizeGB)
++	}
++
++	scratchFinalPath := filepath.Join(l.root, vhdFileName)
++
++	scratchSource, err := os.OpenFile(scratchFinalPath, os.O_RDONLY, 0700)
++	if err != nil {
++		if !os.IsNotExist(err) {
++			return nil, errors.Wrapf(err, "failed to open vhd %s for read", vhdFileName)
++		}
++
++		log.G(ctx).Debugf("vhdx %s not found, creating a new one", vhdFileName)
++
++		// Golang logic for ioutil.TempFile without the file creation
++		r := uint32(time.Now().UnixNano() + int64(os.Getpid()))
++		r = r*1664525 + 1013904223 // constants from Numerical Recipes
++
++		scratchTempName := fmt.Sprintf("scratch-%s-tmp.vhdx", strconv.Itoa(int(1e9 + r%1e9))[1:])
++		scratchTempPath := filepath.Join(l.root, scratchTempName)
++
++		// Create the scratch
++		rhcs := runhcs.Runhcs{
++			Debug:     true,
++			Log:       filepath.Join(l.root, "runhcs-scratch.log"),
++			LogFormat: runhcs.JSON,
++			Owner:     "containerd",
++		}
++
++		opt := runhcs.CreateScratchOpts{
++			SizeGB: sizeGB,
++		}
++
++		if err := rhcs.CreateScratchWithOpts(ctx, scratchTempPath, &opt); err != nil {
++			os.Remove(scratchTempPath)
++			return nil, errors.Wrapf(err, "failed to create '%s' temp file", scratchTempName)
++		}
++		if err := os.Rename(scratchTempPath, scratchFinalPath); err != nil {
++			os.Remove(scratchTempPath)
++			return nil, errors.Wrapf(err, "failed to rename '%s' temp file to 'scratch.vhdx'", scratchTempName)
++		}
++		scratchSource, err = os.OpenFile(scratchFinalPath, os.O_RDONLY, 0700)
++		if err != nil {
++			os.Remove(scratchFinalPath)
++			return nil, errors.Wrap(err, "failed to open scratch.vhdx for read after creation")
++		}
++	} else {
++		log.G(ctx).Debugf("scratch vhd %s was already present. Retrieved from cache", vhdFileName)
++	}
++	return scratchSource, nil
++}
+diff --git a/snapshots/windows/wcow.go b/snapshots/windows/wcow.go
+new file mode 100644
+index 000000000..6b8bed0da
+--- /dev/null
++++ b/snapshots/windows/wcow.go
+@@ -0,0 +1,221 @@
++// +build windows
++
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package windows
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++
++	"github.com/Microsoft/go-winio/vhd"
++	"github.com/Microsoft/hcsshim"
++	"github.com/containerd/containerd/errdefs"
++	"github.com/containerd/containerd/log"
++	"github.com/containerd/containerd/mount"
++	"github.com/containerd/containerd/plugin"
++	"github.com/containerd/containerd/snapshots"
++	"github.com/containerd/containerd/snapshots/storage"
++	"github.com/pkg/errors"
++)
++
++type wcowSnapshotter struct {
++	*windowsSnapshotterBase
++	info hcsshim.DriverInfo
++}
++
++// NewSnapshotter returns a new windows snapshotter
++func NewWCOWSnapshotter(ic *plugin.InitContext) (snapshots.Snapshotter, error) {
++	ws, err := newWindowsSnapshotter(ic.Root, ic.Config.(*WindowsSnapshotterConfig))
++	if err != nil {
++		return nil, err
++	}
++	return &wcowSnapshotter{
++		info: hcsshim.DriverInfo{
++			HomeDir: filepath.Join(ic.Root, "snapshots"),
++		},
++		windowsSnapshotterBase: ws,
++	}, nil
++}
++
++func (w *wcowSnapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
++	return w.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
++}
++
++func (w *wcowSnapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
++	return w.createSnapshot(ctx, snapshots.KindView, key, parent, opts)
++}
++
++func (w *wcowSnapshotter) wcowMounts(snapshot storage.Snapshot) []mount.Mount {
++	marr := w.mounts(snapshot)
++	for i := range marr {
++		marr[i].Type = "windows-layer"
++	}
++	return marr
++}
++
++// Mounts returns the mounts for the transaction identified by key. Can be
++// called on an read-write or readonly transaction.
++//
++// This can be used to recover mounts after calling View or Prepare.
++func (w *wcowSnapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, error) {
++	ctx, t, err := w.ms.TransactionContext(ctx, false)
++	if err != nil {
++		return nil, err
++	}
++	defer t.Rollback()
++
++	snapshot, err := storage.GetSnapshot(ctx, key)
++	if err != nil {
++		return nil, errors.Wrap(err, "failed to get snapshot mount")
++	}
++	return w.wcowMounts(snapshot), nil
++}
++
++// Remove abandons the transaction identified by key. All resources
++// associated with the key will be removed.
++func (w *wcowSnapshotter) Remove(ctx context.Context, key string) error {
++	ctx, t, err := w.ms.TransactionContext(ctx, true)
++	if err != nil {
++		return err
++	}
++	defer t.Rollback()
++
++	id, snInfo, _, err := storage.GetInfo(ctx, key)
++	if err != nil {
++		return errors.Wrapf(errdefs.ErrFailedPrecondition, "failed to get snapshot info: %s", err)
++	}
++
++	_, _, err = storage.Remove(ctx, key)
++	if err != nil {
++		return errors.Wrap(err, "failed to remove")
++	}
++
++	path := w.getSnapshotDir(id)
++	overridePath := w.getResolvedSnapshotDir(id, snInfo)
++	renamedID := "rm-" + id
++	renamed := w.getSnapshotDir(renamedID)
++	if err := os.Rename(path, renamed); err != nil {
++		// Sometimes if there are some open handles to the files (especially VHD)
++		// inside the snapshot directory the rename call will return "access
++		// denied" or "file is being used by another process" errors.  Just
++		// returning that error causes the entire snapshot garbage collection
++		// operation to fail. To avoid that we return failed pre-condition error
++		// here so that snapshot garbage collection can continue and can cleanup
++		// other snapshots.
++		if os.IsPermission(err) {
++			// If permission denied, it's possible that the scratch is still mounted, an
++			// artifact after a hard daemon crash for example. Worth a shot to try detaching it
++			// before retrying the rename.
++			if detachErr := vhd.DetachVhd(filepath.Join(path, "sandbox.vhdx")); detachErr != nil {
++				return errors.Wrapf(errdefs.ErrFailedPrecondition, "failed to detach vhd during snapshot cleanup %s: %s", detachErr.Error(), err)
++
++			}
++			if rerr := os.Rename(path, renamed); rerr != nil {
++				return errors.Wrapf(errdefs.ErrFailedPrecondition, "second rename attempt failed for snapshot %s with error %s", id, rerr)
++			}
++		} else {
++			return errors.Wrap(errdefs.ErrFailedPrecondition, err.Error())
++		}
++
++	}
++
++	if err := t.Commit(); err != nil {
++		if err1 := os.Rename(renamed, path); err1 != nil {
++			// May cause inconsistent data on disk
++			log.G(ctx).WithError(err1).Errorf("failed to undo rename after failed commit")
++		}
++		return errors.Wrap(err, "failed to commit")
++	}
++
++	drInfo := w.info
++	destroyID := renamedID
++	if path != overridePath {
++		drInfo.HomeDir = filepath.Dir(overridePath)
++		// We don't renamed the override directory, so pass the actual ID in that case
++		destroyID = id
++	}
++	if err := hcsshim.DestroyLayer(drInfo, destroyID); err != nil {
++		// Must be cleaned up, any "rm-*" could be removed if no active transactions
++		log.G(ctx).WithError(err).WithField("path", renamed).Warnf("Failed to remove root filesystem")
++	}
++	if err := os.RemoveAll(renamed); err != nil && !os.IsNotExist(err) {
++		log.G(ctx).WithError(err).Warnf("failed to remove snapshot dir %s", renamed)
++	}
++
++	return nil
++}
++
++func (w *wcowSnapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
++	ctx, t, err := w.ms.TransactionContext(ctx, true)
++	if err != nil {
++		return nil, err
++	}
++	defer t.Rollback()
++
++	newSnapshot, snapshotInfo, err := w.createSnapshotCommon(ctx, kind, key, parent, opts)
++	if err != nil {
++		return nil, err
++	}
++	defer onErrorDirectoryCleanup(ctx, &err, w.getSnapshotDir(newSnapshot.ID), w.getResolvedSnapshotDir(newSnapshot.ID, snapshotInfo))
++
++	if kind == snapshots.KindActive {
++		// IO/disk space optimization
++		//
++		// We only need one sandbox.vhdx for the container. Skip making one for this
++		// snapshot if this isn't the snapshot that just houses the final sandbox.vhd
++		// that will be mounted as the containers scratch. Currently the key for a snapshot
++		// where a layer will be extracted to will have the string `extract-` in it.
++		if !strings.Contains(key, snapshots.UnpackKeyPrefix) {
++			parentLayerPaths := w.parentIDsToParentPaths(newSnapshot.ParentIDs)
++
++			var parentPath string
++			if len(parentLayerPaths) != 0 {
++				parentPath = parentLayerPaths[0]
++			}
++
++			if err := hcsshim.CreateSandboxLayer(w.info, newSnapshot.ID, parentPath, parentLayerPaths); err != nil {
++				return nil, errors.Wrap(err, "failed to create sandbox layer")
++			}
++
++			var sizeGB int
++			if sizeGBstr, ok := snapshotInfo.Labels[rootfsSizeLabel]; ok {
++				i32, err := strconv.ParseInt(sizeGBstr, 10, 32)
++				if err != nil {
++					return nil, errors.Wrapf(err, "failed to parse label %q=%q", rootfsSizeLabel, sizeGBstr)
++				}
++				sizeGB = int(i32)
++			}
++
++			if sizeGB > 0 {
++				const gbToByte = 1024 * 1024 * 1024
++				if err := hcsshim.ExpandSandboxSize(w.info, newSnapshot.ID, uint64(gbToByte*sizeGB)); err != nil {
++					return nil, errors.Wrapf(err, "failed to expand scratch size to %d GB", sizeGB)
++				}
++			}
++		}
++	}
++
++	if err := t.Commit(); err != nil {
++		return nil, errors.Wrap(err, "commit failed")
++	}
++
++	return w.wcowMounts(newSnapshot), nil
++}
+diff --git a/snapshots/windows/windows.go b/snapshots/windows/windows.go
+deleted file mode 100644
+index 4d9af0e66..000000000
+--- a/snapshots/windows/windows.go
++++ /dev/null
+@@ -1,558 +0,0 @@
+-//go:build windows
+-// +build windows
+-
+-/*
+-   Copyright The containerd Authors.
+-
+-   Licensed under the Apache License, Version 2.0 (the "License");
+-   you may not use this file except in compliance with the License.
+-   You may obtain a copy of the License at
+-
+-       http://www.apache.org/licenses/LICENSE-2.0
+-
+-   Unless required by applicable law or agreed to in writing, software
+-   distributed under the License is distributed on an "AS IS" BASIS,
+-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-   See the License for the specific language governing permissions and
+-   limitations under the License.
+-*/
+-
+-package windows
+-
+-import (
+-	"context"
+-	"encoding/json"
+-	"errors"
+-	"fmt"
+-	"io"
+-	"os"
+-	"path/filepath"
+-	"strconv"
+-	"strings"
+-
+-	"github.com/Microsoft/go-winio"
+-	winfs "github.com/Microsoft/go-winio/pkg/fs"
+-	"github.com/Microsoft/go-winio/vhd"
+-	"github.com/Microsoft/hcsshim"
+-	"github.com/Microsoft/hcsshim/computestorage"
+-	"github.com/Microsoft/hcsshim/pkg/ociwclayer"
+-	"github.com/containerd/containerd/errdefs"
+-	"github.com/containerd/containerd/log"
+-	"github.com/containerd/containerd/mount"
+-	"github.com/containerd/containerd/platforms"
+-	"github.com/containerd/containerd/plugin"
+-	"github.com/containerd/containerd/snapshots"
+-	"github.com/containerd/containerd/snapshots/storage"
+-	"github.com/containerd/continuity/fs"
+-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+-)
+-
+-func init() {
+-	plugin.Register(&plugin.Registration{
+-		Type: plugin.SnapshotPlugin,
+-		ID:   "windows",
+-		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+-			ic.Meta.Platforms = []ocispec.Platform{platforms.DefaultSpec()}
+-			return NewSnapshotter(ic.Root)
+-		},
+-	})
+-}
+-
+-const (
+-	// Label to specify that we should make a scratch space for a UtilityVM.
+-	uvmScratchLabel = "containerd.io/snapshot/io.microsoft.vm.storage.scratch"
+-	// Label to control a containers scratch space size (sandbox.vhdx).
+-	rootfsSizeLabel = "containerd.io/snapshot/io.microsoft.container.storage.rootfs.size-gb"
+-)
+-
+-type snapshotter struct {
+-	root string
+-	info hcsshim.DriverInfo
+-	ms   *storage.MetaStore
+-}
+-
+-// NewSnapshotter returns a new windows snapshotter
+-func NewSnapshotter(root string) (snapshots.Snapshotter, error) {
+-	fsType, err := winfs.GetFileSystemType(root)
+-	if err != nil {
+-		return nil, err
+-	}
+-	if strings.ToLower(fsType) != "ntfs" {
+-		return nil, fmt.Errorf("%s is not on an NTFS volume - only NTFS volumes are supported: %w", root, errdefs.ErrInvalidArgument)
+-	}
+-
+-	if err := os.MkdirAll(root, 0700); err != nil {
+-		return nil, err
+-	}
+-	ms, err := storage.NewMetaStore(filepath.Join(root, "metadata.db"))
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
+-		return nil, err
+-	}
+-
+-	return &snapshotter{
+-		info: hcsshim.DriverInfo{
+-			HomeDir: filepath.Join(root, "snapshots"),
+-		},
+-		root: root,
+-		ms:   ms,
+-	}, nil
+-}
+-
+-// Stat returns the info for an active or committed snapshot by name or
+-// key.
+-//
+-// Should be used for parent resolution, existence checks and to discern
+-// the kind of snapshot.
+-func (s *snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, false)
+-	if err != nil {
+-		return snapshots.Info{}, err
+-	}
+-	defer t.Rollback()
+-
+-	_, info, _, err := storage.GetInfo(ctx, key)
+-	return info, err
+-}
+-
+-func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpaths ...string) (snapshots.Info, error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, true)
+-	if err != nil {
+-		return snapshots.Info{}, err
+-	}
+-	defer t.Rollback()
+-
+-	info, err = storage.UpdateInfo(ctx, info, fieldpaths...)
+-	if err != nil {
+-		return snapshots.Info{}, err
+-	}
+-
+-	if err := t.Commit(); err != nil {
+-		return snapshots.Info{}, err
+-	}
+-
+-	return info, nil
+-}
+-
+-func (s *snapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, false)
+-	if err != nil {
+-		return snapshots.Usage{}, err
+-	}
+-	id, info, usage, err := storage.GetInfo(ctx, key)
+-	t.Rollback() // transaction no longer needed at this point.
+-
+-	if err != nil {
+-		return snapshots.Usage{}, err
+-	}
+-
+-	if info.Kind == snapshots.KindActive {
+-		path := s.getSnapshotDir(id)
+-		du, err := fs.DiskUsage(ctx, path)
+-		if err != nil {
+-			return snapshots.Usage{}, err
+-		}
+-
+-		usage = snapshots.Usage(du)
+-	}
+-
+-	return usage, nil
+-}
+-
+-func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+-	return s.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+-}
+-
+-func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+-	return s.createSnapshot(ctx, snapshots.KindView, key, parent, opts)
+-}
+-
+-// Mounts returns the mounts for the transaction identified by key. Can be
+-// called on an read-write or readonly transaction.
+-//
+-// This can be used to recover mounts after calling View or Prepare.
+-func (s *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, false)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer t.Rollback()
+-
+-	snapshot, err := storage.GetSnapshot(ctx, key)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to get snapshot mount: %w", err)
+-	}
+-	return s.mounts(snapshot), nil
+-}
+-
+-func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) (retErr error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, true)
+-	if err != nil {
+-		return err
+-	}
+-
+-	defer func() {
+-		if retErr != nil {
+-			if rerr := t.Rollback(); rerr != nil {
+-				log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
+-			}
+-		}
+-	}()
+-
+-	// grab the existing id
+-	id, _, _, err := storage.GetInfo(ctx, key)
+-	if err != nil {
+-		return fmt.Errorf("failed to get storage info for %s: %w", key, err)
+-	}
+-
+-	snapshot, err := storage.GetSnapshot(ctx, key)
+-	if err != nil {
+-		return err
+-	}
+-
+-	path := s.getSnapshotDir(id)
+-
+-	// If (windowsDiff).Apply was used to populate this layer, then it's already in the 'committed' state.
+-	// See createSnapshot below for more details
+-	if !strings.Contains(key, snapshots.UnpackKeyPrefix) {
+-		if err := s.convertScratchToReadOnlyLayer(ctx, snapshot, path); err != nil {
+-			return err
+-		}
+-	}
+-
+-	usage, err := fs.DiskUsage(ctx, path)
+-	if err != nil {
+-		return fmt.Errorf("failed to collect disk usage of snapshot storage: %s: %w", path, err)
+-	}
+-
+-	if _, err := storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
+-		return fmt.Errorf("failed to commit snapshot: %w", err)
+-	}
+-	return t.Commit()
+-}
+-
+-// Remove abandons the transaction identified by key. All resources
+-// associated with the key will be removed.
+-func (s *snapshotter) Remove(ctx context.Context, key string) error {
+-	ctx, t, err := s.ms.TransactionContext(ctx, true)
+-	if err != nil {
+-		return err
+-	}
+-	defer t.Rollback()
+-
+-	id, _, err := storage.Remove(ctx, key)
+-	if err != nil {
+-		return fmt.Errorf("failed to remove: %w", err)
+-	}
+-
+-	path := s.getSnapshotDir(id)
+-	renamedID := "rm-" + id
+-	renamed := s.getSnapshotDir(renamedID)
+-	if err := os.Rename(path, renamed); err != nil && !os.IsNotExist(err) {
+-		// Sometimes if there are some open handles to the files (especially VHD)
+-		// inside the snapshot directory the rename call will return "access
+-		// denied" or "file is being used by another process" errors.  Just
+-		// returning that error causes the entire snapshot garbage collection
+-		// operation to fail. To avoid that we return failed pre-condition error
+-		// here so that snapshot garbage collection can continue and can cleanup
+-		// other snapshots.
+-		if os.IsPermission(err) {
+-			// If permission denied, it's possible that the scratch is still mounted, an
+-			// artifact after a hard daemon crash for example. Worth a shot to try detaching it
+-			// before retrying the rename.
+-			if detachErr := vhd.DetachVhd(filepath.Join(path, "sandbox.vhdx")); detachErr != nil {
+-				return fmt.Errorf("%w: failed to detach vhd during snapshot cleanup %s: %s", errdefs.ErrFailedPrecondition, detachErr.Error(), err)
+-			}
+-			if renameErr := os.Rename(path, renamed); renameErr != nil && !os.IsNotExist(renameErr) {
+-				return fmt.Errorf("%w: second rename attempt failed  %s: %s", errdefs.ErrFailedPrecondition, renameErr.Error(), err)
+-			}
+-		} else {
+-			return fmt.Errorf("%w: %s", errdefs.ErrFailedPrecondition, err.Error())
+-		}
+-	}
+-
+-	if err := t.Commit(); err != nil {
+-		if err1 := os.Rename(renamed, path); err1 != nil {
+-			// May cause inconsistent data on disk
+-			log.G(ctx).WithError(err1).WithField("path", renamed).Error("Failed to rename after failed commit")
+-		}
+-		return fmt.Errorf("failed to commit: %w", err)
+-	}
+-
+-	if err := hcsshim.DestroyLayer(s.info, renamedID); err != nil {
+-		// Must be cleaned up, any "rm-*" could be removed if no active transactions
+-		log.G(ctx).WithError(err).WithField("path", renamed).Warnf("Failed to remove root filesystem")
+-	}
+-
+-	return nil
+-}
+-
+-// Walk the committed snapshots.
+-func (s *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, fs ...string) error {
+-	ctx, t, err := s.ms.TransactionContext(ctx, false)
+-	if err != nil {
+-		return err
+-	}
+-	defer t.Rollback()
+-
+-	return storage.WalkInfo(ctx, fn, fs...)
+-}
+-
+-// Close closes the snapshotter
+-func (s *snapshotter) Close() error {
+-	return s.ms.Close()
+-}
+-
+-func (s *snapshotter) mounts(sn storage.Snapshot) []mount.Mount {
+-	var (
+-		roFlag           string
+-		source           string
+-		parentLayerPaths []string
+-	)
+-
+-	if sn.Kind == snapshots.KindView {
+-		roFlag = "ro"
+-	} else {
+-		roFlag = "rw"
+-	}
+-
+-	if len(sn.ParentIDs) == 0 || sn.Kind == snapshots.KindActive {
+-		source = s.getSnapshotDir(sn.ID)
+-		parentLayerPaths = s.parentIDsToParentPaths(sn.ParentIDs)
+-	} else {
+-		source = s.getSnapshotDir(sn.ParentIDs[0])
+-		parentLayerPaths = s.parentIDsToParentPaths(sn.ParentIDs[1:])
+-	}
+-
+-	// error is not checked here, as a string array will never fail to Marshal
+-	parentLayersJSON, _ := json.Marshal(parentLayerPaths)
+-	parentLayersOption := mount.ParentLayerPathsFlag + string(parentLayersJSON)
+-
+-	var mounts []mount.Mount
+-	mounts = append(mounts, mount.Mount{
+-		Source: source,
+-		Type:   "windows-layer",
+-		Options: []string{
+-			roFlag,
+-			parentLayersOption,
+-		},
+-	})
+-
+-	return mounts
+-}
+-
+-func (s *snapshotter) getSnapshotDir(id string) string {
+-	return filepath.Join(s.root, "snapshots", id)
+-}
+-
+-func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) ([]mount.Mount, error) {
+-	ctx, t, err := s.ms.TransactionContext(ctx, true)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer t.Rollback()
+-
+-	newSnapshot, err := storage.CreateSnapshot(ctx, kind, key, parent, opts...)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to create snapshot: %w", err)
+-	}
+-
+-	if kind == snapshots.KindActive {
+-		log.G(ctx).Debug("createSnapshot active")
+-		// Create the new snapshot dir
+-		snDir := s.getSnapshotDir(newSnapshot.ID)
+-		if err := os.MkdirAll(snDir, 0700); err != nil {
+-			return nil, err
+-		}
+-
+-		// IO/disk space optimization
+-		//
+-		// We only need one sandbox.vhdx for the container. Skip making one for this
+-		// snapshot if this isn't the snapshot that just houses the final sandbox.vhd
+-		// that will be mounted as the containers scratch. Currently the key for a snapshot
+-		// where a layer will be extracted to will have the string `extract-` in it.
+-		if !strings.Contains(key, snapshots.UnpackKeyPrefix) {
+-			parentLayerPaths := s.parentIDsToParentPaths(newSnapshot.ParentIDs)
+-
+-			var snapshotInfo snapshots.Info
+-			for _, o := range opts {
+-				o(&snapshotInfo)
+-			}
+-
+-			var sizeGB int
+-			if sizeGBstr, ok := snapshotInfo.Labels[rootfsSizeLabel]; ok {
+-				i32, err := strconv.ParseInt(sizeGBstr, 10, 32)
+-				if err != nil {
+-					return nil, fmt.Errorf("failed to parse label %q=%q: %w", rootfsSizeLabel, sizeGBstr, err)
+-				}
+-				sizeGB = int(i32)
+-			}
+-
+-			var makeUVMScratch bool
+-			if _, ok := snapshotInfo.Labels[uvmScratchLabel]; ok {
+-				makeUVMScratch = true
+-			}
+-
+-			// This has to be run first to avoid clashing with the containers sandbox.vhdx.
+-			if makeUVMScratch {
+-				if err := s.createUVMScratchLayer(ctx, snDir, parentLayerPaths); err != nil {
+-					return nil, fmt.Errorf("failed to make UVM's scratch layer: %w", err)
+-				}
+-			}
+-			if err := s.createScratchLayer(ctx, snDir, parentLayerPaths, sizeGB); err != nil {
+-				return nil, fmt.Errorf("failed to create scratch layer: %w", err)
+-			}
+-		}
+-	}
+-
+-	if err := t.Commit(); err != nil {
+-		return nil, fmt.Errorf("commit failed: %w", err)
+-	}
+-
+-	return s.mounts(newSnapshot), nil
+-}
+-
+-func (s *snapshotter) parentIDsToParentPaths(parentIDs []string) []string {
+-	var parentLayerPaths []string
+-	for _, ID := range parentIDs {
+-		parentLayerPaths = append(parentLayerPaths, s.getSnapshotDir(ID))
+-	}
+-	return parentLayerPaths
+-}
+-
+-// This is essentially a recreation of what HCS' CreateSandboxLayer does with some extra bells and
+-// whistles like expanding the volume if a size is specified. This will create a 1GB scratch
+-// vhdx to be used if a different sized scratch that is not equal to the default of 20 is requested.
+-func (s *snapshotter) createScratchLayer(ctx context.Context, snDir string, parentLayers []string, sizeGB int) error {
+-	parentLen := len(parentLayers)
+-	if parentLen == 0 {
+-		return errors.New("no parent layers present")
+-	}
+-	baseLayer := parentLayers[parentLen-1]
+-
+-	var (
+-		templateBase     = filepath.Join(baseLayer, "blank-base.vhdx")
+-		templateDiffDisk = filepath.Join(baseLayer, "blank.vhdx")
+-		newDisks         = sizeGB > 0 && sizeGB < 20
+-		expand           = sizeGB > 0 && sizeGB != 20
+-	)
+-
+-	// If a size greater than 0 and less than 20 (the default size produced by hcs)
+-	// was specified we make a new set of disks to be used. We make it a 1GB disk and just
+-	// expand it to the size specified so for future container runs we don't need to remake a disk.
+-	if newDisks {
+-		templateBase = filepath.Join(baseLayer, "scratch.vhdx")
+-		templateDiffDisk = filepath.Join(baseLayer, "scratch-diff.vhdx")
+-	}
+-
+-	if _, err := os.Stat(templateDiffDisk); os.IsNotExist(err) {
+-		// Scratch disk not present so lets make it.
+-		if err := computestorage.SetupContainerBaseLayer(ctx, baseLayer, templateBase, templateDiffDisk, 1); err != nil {
+-			return fmt.Errorf("failed to create scratch vhdx at %q: %w", baseLayer, err)
+-		}
+-	}
+-
+-	dest := filepath.Join(snDir, "sandbox.vhdx")
+-	if err := copyScratchDisk(templateDiffDisk, dest); err != nil {
+-		return err
+-	}
+-
+-	if expand {
+-		gbToByte := 1024 * 1024 * 1024
+-		if err := hcsshim.ExpandSandboxSize(s.info, filepath.Base(snDir), uint64(gbToByte*sizeGB)); err != nil {
+-			return fmt.Errorf("failed to expand sandbox vhdx size to %d GB: %w", sizeGB, err)
+-		}
+-	}
+-	return nil
+-}
+-
+-// convertScratchToReadOnlyLayer reimports the layer over itself, to transfer the files from the sandbox.vhdx to the on-disk storage.
+-func (s *snapshotter) convertScratchToReadOnlyLayer(ctx context.Context, snapshot storage.Snapshot, path string) (retErr error) {
+-
+-	// TODO darrenstahlmsft: When this is done isolated, we should disable these.
+-	// it currently cannot be disabled, unless we add ref counting. Since this is
+-	// temporary, leaving it enabled is OK for now.
+-	// https://github.com/containerd/containerd/issues/1681
+-	if err := winio.EnableProcessPrivileges([]string{winio.SeBackupPrivilege, winio.SeRestorePrivilege}); err != nil {
+-		return fmt.Errorf("failed to enable necessary privileges: %w", err)
+-	}
+-
+-	parentLayerPaths := s.parentIDsToParentPaths(snapshot.ParentIDs)
+-	reader, writer := io.Pipe()
+-
+-	go func() {
+-		err := ociwclayer.ExportLayerToTar(ctx, writer, path, parentLayerPaths)
+-		writer.CloseWithError(err)
+-	}()
+-
+-	if _, err := ociwclayer.ImportLayerFromTar(ctx, reader, path, parentLayerPaths); err != nil {
+-		return fmt.Errorf("failed to reimport snapshot: %w", err)
+-	}
+-
+-	if _, err := io.Copy(io.Discard, reader); err != nil {
+-		return fmt.Errorf("failed discarding extra data in import stream: %w", err)
+-	}
+-
+-	// NOTE: We do not delete the sandbox.vhdx here, as that will break later calls to
+-	// ociwclayer.ExportLayerToTar for this snapshot.
+-	// As a consequence, the data for this layer is held twice, once on-disk and once
+-	// in the sandbox.vhdx.
+-	// TODO: This is either a bug or misfeature in hcsshim, so will need to be resolved
+-	// there first.
+-
+-	return nil
+-}
+-
+-// This handles creating the UVMs scratch layer.
+-func (s *snapshotter) createUVMScratchLayer(ctx context.Context, snDir string, parentLayers []string) error {
+-	parentLen := len(parentLayers)
+-	if parentLen == 0 {
+-		return errors.New("no parent layers present")
+-	}
+-	baseLayer := parentLayers[parentLen-1]
+-
+-	// Make sure base layer has a UtilityVM folder.
+-	uvmPath := filepath.Join(baseLayer, "UtilityVM")
+-	if _, err := os.Stat(uvmPath); os.IsNotExist(err) {
+-		return fmt.Errorf("failed to find UtilityVM directory in base layer %q: %w", baseLayer, err)
+-	}
+-
+-	templateDiffDisk := filepath.Join(uvmPath, "SystemTemplate.vhdx")
+-
+-	// Check if SystemTemplate disk doesn't exist for some reason (this should be made during the unpacking
+-	// of the base layer).
+-	if _, err := os.Stat(templateDiffDisk); os.IsNotExist(err) {
+-		return fmt.Errorf("%q does not exist in Utility VM image", templateDiffDisk)
+-	}
+-
+-	// Move the sandbox.vhdx into a nested vm folder to avoid clashing with a containers sandbox.vhdx.
+-	vmScratchDir := filepath.Join(snDir, "vm")
+-	if err := os.MkdirAll(vmScratchDir, 0777); err != nil {
+-		return fmt.Errorf("failed to make `vm` directory for vm's scratch space: %w", err)
+-	}
+-
+-	return copyScratchDisk(templateDiffDisk, filepath.Join(vmScratchDir, "sandbox.vhdx"))
+-}
+-
+-func copyScratchDisk(source, dest string) error {
+-	scratchSource, err := os.OpenFile(source, os.O_RDWR, 0700)
+-	if err != nil {
+-		return fmt.Errorf("failed to open %s: %w", source, err)
+-	}
+-	defer scratchSource.Close()
+-
+-	f, err := os.OpenFile(dest, os.O_RDWR|os.O_CREATE, 0700)
+-	if err != nil {
+-		return fmt.Errorf("failed to create sandbox.vhdx in snapshot: %w", err)
+-	}
+-	defer f.Close()
+-
+-	if _, err := io.Copy(f, scratchSource); err != nil {
+-		os.Remove(dest)
+-		return fmt.Errorf("failed to copy cached %q to %q in snapshot: %w", source, dest, err)
+-	}
+-	return nil
+-}

@@ -1,0 +1,5130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kevin Parsons <kevpar@microsoft.com>
+Date: Fri, 24 May 2019 00:22:44 -0700
+Subject: [PATCH] Add OpenCensus instrumentation
+
+This change has four parts:
+
+- Add the OC GRPC handler to the GRPC server.
+  This causes a new OC span to be started and associated with the
+  context for every incoming GRPC request. If the request metadata
+  includes existing span context, the new span will be parented to the
+  existing span.
+
+- Add a small exporter to log completed span data to Logrus.
+  OC supports the concept of exporters which send the data for completed
+  spans to an external system for storage and tracking. I copied the
+  LogrusExporter implementation from hcsshim.
+
+  While this obviously isn't a complete distributed tracing system, it
+  allows span data to be easily stored in log files and seen on the
+  console. It also works nicely with the existing use of Logrus hooks
+  to send log data to other systems (such as ETW on Windows).
+
+  Long-term, we should also add the OC agent exporter, which sends the
+  span data to the OC agent running on the same system. This is the
+  recommended path for exporting spans. However, since this requires
+  an additional binary running on the system, I think there is value in
+  keeping the LogrusExporter as a light-weight alternative.
+
+- Modify log.GetLogger to add span correlation data to the logrus.Entry.
+  When a Logrus entry is returned from log.GetLogger, if the context
+  also contains a saved span, then information is added to the entry to
+  allow correlating the log messages with the current span.
+
+  This will cause all messages logged via log.G(ctx) to contain
+  additional fields for trace ID and span ID. This
+  does make these messages more verbose, but will be very useful when
+  correlating logs to spans.
+
+- Add a small wrapper function copied from hcsshim which facilitates
+  settings span status based on an error value.
+
+Signed-off-by: Kevin Parsons <kevpar@microsoft.com>
+---
+ cmd/containerd/command/main.go                |   5 +
+ go.mod                                        |   4 +-
+ log/context.go                                |  25 +-
+ oc/exporter.go                                |  59 +++
+ oc/span.go                                    |  33 ++
+ services/server/server.go                     |   2 +
+ .../internal/tagencoding/tagencoding.go       |  75 ++++
+ .../go.opencensus.io/metric/metricdata/doc.go |  19 +
+ .../metric/metricdata/exemplar.go             |  38 ++
+ .../metric/metricdata/label.go                |  35 ++
+ .../metric/metricdata/metric.go               |  46 ++
+ .../metric/metricdata/point.go                | 193 +++++++++
+ .../metric/metricdata/type_string.go          |  16 +
+ .../metric/metricdata/unit.go                 |  27 ++
+ .../metric/metricproducer/manager.go          |  78 ++++
+ .../metric/metricproducer/producer.go         |  28 ++
+ .../go.opencensus.io/plugin/ocgrpc/client.go  |  56 +++
+ .../plugin/ocgrpc/client_metrics.go           | 109 +++++
+ .../plugin/ocgrpc/client_stats_handler.go     |  49 +++
+ vendor/go.opencensus.io/plugin/ocgrpc/doc.go  |  19 +
+ .../go.opencensus.io/plugin/ocgrpc/server.go  |  81 ++++
+ .../plugin/ocgrpc/server_metrics.go           |  99 +++++
+ .../plugin/ocgrpc/server_stats_handler.go     |  63 +++
+ .../plugin/ocgrpc/stats_common.go             | 227 ++++++++++
+ .../plugin/ocgrpc/trace_common.go             | 107 +++++
+ vendor/go.opencensus.io/resource/resource.go  | 164 +++++++
+ vendor/go.opencensus.io/stats/doc.go          |  69 +++
+ .../go.opencensus.io/stats/internal/record.go |  25 ++
+ vendor/go.opencensus.io/stats/measure.go      | 109 +++++
+ .../go.opencensus.io/stats/measure_float64.go |  55 +++
+ .../go.opencensus.io/stats/measure_int64.go   |  55 +++
+ vendor/go.opencensus.io/stats/record.go       | 137 ++++++
+ vendor/go.opencensus.io/stats/units.go        |  26 ++
+ .../stats/view/aggregation.go                 | 123 ++++++
+ .../stats/view/aggregation_data.go            | 336 +++++++++++++++
+ .../go.opencensus.io/stats/view/collector.go  |  86 ++++
+ vendor/go.opencensus.io/stats/view/doc.go     |  47 ++
+ vendor/go.opencensus.io/stats/view/export.go  |  45 ++
+ vendor/go.opencensus.io/stats/view/view.go    | 221 ++++++++++
+ .../stats/view/view_to_metric.go              | 147 +++++++
+ vendor/go.opencensus.io/stats/view/worker.go  | 405 ++++++++++++++++++
+ .../stats/view/worker_commands.go             | 186 ++++++++
+ vendor/go.opencensus.io/tag/context.go        |  43 ++
+ vendor/go.opencensus.io/tag/doc.go            |  26 ++
+ vendor/go.opencensus.io/tag/key.go            |  44 ++
+ vendor/go.opencensus.io/tag/map.go            | 229 ++++++++++
+ vendor/go.opencensus.io/tag/map_codec.go      | 239 +++++++++++
+ vendor/go.opencensus.io/tag/metadata.go       |  52 +++
+ vendor/go.opencensus.io/tag/profile_19.go     |  31 ++
+ vendor/go.opencensus.io/tag/profile_not19.go  |  23 +
+ vendor/go.opencensus.io/tag/validate.go       |  56 +++
+ .../trace/propagation/propagation.go          | 108 +++++
+ vendor/modules.txt                            |  10 +
+ 53 files changed, 4581 insertions(+), 9 deletions(-)
+ create mode 100644 oc/exporter.go
+ create mode 100644 oc/span.go
+ create mode 100644 vendor/go.opencensus.io/internal/tagencoding/tagencoding.go
+ create mode 100644 vendor/go.opencensus.io/metric/metricdata/doc.go
+ create mode 100644 vendor/go.opencensus.io/metric/metricdata/exemplar.go
+ create mode 100644 vendor/go.opencensus.io/metric/metricdata/label.go
+ create mode 100644 vendor/go.opencensus.io/metric/metricdata/metric.go
+ create mode 100644 vendor/go.opencensus.io/metric/metricdata/point.go
+ create mode 100644 vendor/go.opencensus.io/metric/metricdata/type_string.go
+ create mode 100644 vendor/go.opencensus.io/metric/metricdata/unit.go
+ create mode 100644 vendor/go.opencensus.io/metric/metricproducer/manager.go
+ create mode 100644 vendor/go.opencensus.io/metric/metricproducer/producer.go
+ create mode 100644 vendor/go.opencensus.io/plugin/ocgrpc/client.go
+ create mode 100644 vendor/go.opencensus.io/plugin/ocgrpc/client_metrics.go
+ create mode 100644 vendor/go.opencensus.io/plugin/ocgrpc/client_stats_handler.go
+ create mode 100644 vendor/go.opencensus.io/plugin/ocgrpc/doc.go
+ create mode 100644 vendor/go.opencensus.io/plugin/ocgrpc/server.go
+ create mode 100644 vendor/go.opencensus.io/plugin/ocgrpc/server_metrics.go
+ create mode 100644 vendor/go.opencensus.io/plugin/ocgrpc/server_stats_handler.go
+ create mode 100644 vendor/go.opencensus.io/plugin/ocgrpc/stats_common.go
+ create mode 100644 vendor/go.opencensus.io/plugin/ocgrpc/trace_common.go
+ create mode 100644 vendor/go.opencensus.io/resource/resource.go
+ create mode 100644 vendor/go.opencensus.io/stats/doc.go
+ create mode 100644 vendor/go.opencensus.io/stats/internal/record.go
+ create mode 100644 vendor/go.opencensus.io/stats/measure.go
+ create mode 100644 vendor/go.opencensus.io/stats/measure_float64.go
+ create mode 100644 vendor/go.opencensus.io/stats/measure_int64.go
+ create mode 100644 vendor/go.opencensus.io/stats/record.go
+ create mode 100644 vendor/go.opencensus.io/stats/units.go
+ create mode 100644 vendor/go.opencensus.io/stats/view/aggregation.go
+ create mode 100644 vendor/go.opencensus.io/stats/view/aggregation_data.go
+ create mode 100644 vendor/go.opencensus.io/stats/view/collector.go
+ create mode 100644 vendor/go.opencensus.io/stats/view/doc.go
+ create mode 100644 vendor/go.opencensus.io/stats/view/export.go
+ create mode 100644 vendor/go.opencensus.io/stats/view/view.go
+ create mode 100644 vendor/go.opencensus.io/stats/view/view_to_metric.go
+ create mode 100644 vendor/go.opencensus.io/stats/view/worker.go
+ create mode 100644 vendor/go.opencensus.io/stats/view/worker_commands.go
+ create mode 100644 vendor/go.opencensus.io/tag/context.go
+ create mode 100644 vendor/go.opencensus.io/tag/doc.go
+ create mode 100644 vendor/go.opencensus.io/tag/key.go
+ create mode 100644 vendor/go.opencensus.io/tag/map.go
+ create mode 100644 vendor/go.opencensus.io/tag/map_codec.go
+ create mode 100644 vendor/go.opencensus.io/tag/metadata.go
+ create mode 100644 vendor/go.opencensus.io/tag/profile_19.go
+ create mode 100644 vendor/go.opencensus.io/tag/profile_not19.go
+ create mode 100644 vendor/go.opencensus.io/tag/validate.go
+ create mode 100644 vendor/go.opencensus.io/trace/propagation/propagation.go
+
+diff --git a/cmd/containerd/command/main.go b/cmd/containerd/command/main.go
+index e40c2f35b..34447767d 100644
+--- a/cmd/containerd/command/main.go
++++ b/cmd/containerd/command/main.go
+@@ -32,12 +32,14 @@ import (
+ 	"github.com/containerd/containerd/log"
+ 	_ "github.com/containerd/containerd/metrics" // import containerd build info
+ 	"github.com/containerd/containerd/mount"
++	"github.com/containerd/containerd/oc"
+ 	"github.com/containerd/containerd/services/server"
+ 	srvconfig "github.com/containerd/containerd/services/server/config"
+ 	"github.com/containerd/containerd/sys"
+ 	"github.com/containerd/containerd/version"
+ 	"github.com/sirupsen/logrus"
+ 	"github.com/urfave/cli"
++	"go.opencensus.io/trace"
+ 	"google.golang.org/grpc/grpclog"
+ )
+ 
+@@ -132,6 +134,9 @@ can be used and modified as necessary as a custom configuration.`
+ 			return err
+ 		}
+ 
++		trace.RegisterExporter(&oc.LogrusExporter{})
++		trace.ApplyConfig(trace.Config{DefaultSampler: trace.AlwaysSample()})
++
+ 		// Make sure top-level directories are created early.
+ 		if err := server.CreateTopLevelDirectories(config); err != nil {
+ 			return err
+diff --git a/go.mod b/go.mod
+index 05838cc80..16dae8899 100644
+--- a/go.mod
++++ b/go.mod
+@@ -48,6 +48,7 @@ require (
+ 	github.com/opencontainers/runtime-spec v1.0.3-0.20210326190908-1c3f411f0417
+ 	github.com/opencontainers/selinux v1.10.0
+ 	github.com/pelletier/go-toml v1.9.3
++	github.com/pkg/errors v0.9.1
+ 	github.com/prometheus/client_golang v1.11.1
+ 	github.com/sirupsen/logrus v1.8.1
+ 	github.com/stretchr/testify v1.7.0
+@@ -55,6 +56,7 @@ require (
+ 	github.com/urfave/cli v1.22.2
+ 	github.com/vishvananda/netlink v1.1.1-0.20210330154013-f5de75959ad5
+ 	go.etcd.io/bbolt v1.3.6
++	go.opencensus.io v0.23.0
+ 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.28.0
+ 	go.opentelemetry.io/otel v1.3.0
+ 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.3.0
+@@ -103,7 +105,6 @@ require (
+ 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
+ 	github.com/modern-go/reflect2 v1.0.2 // indirect
+ 	github.com/opencontainers/runtime-tools v0.0.0-20190417131837-cd1349b7c47e // indirect
+-	github.com/pkg/errors v0.9.1 // indirect
+ 	github.com/pmezard/go-difflib v1.0.0 // indirect
+ 	github.com/prometheus/client_model v0.2.0 // indirect
+ 	github.com/prometheus/common v0.30.0 // indirect
+@@ -118,7 +119,6 @@ require (
+ 	github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415 // indirect
+ 	github.com/xeipuuv/gojsonschema v1.2.0 // indirect
+ 	go.mozilla.org/pkcs7 v0.0.0-20200128120323-432b2356ecb1 // indirect
+-	go.opencensus.io v0.23.0 // indirect
+ 	go.opentelemetry.io/otel/exporters/otlp/internal/retry v1.3.0 // indirect
+ 	go.opentelemetry.io/proto/otlp v0.11.0 // indirect
+ 	golang.org/x/crypto v0.0.0-20220315160706-3147a52a75dd // indirect
+diff --git a/log/context.go b/log/context.go
+index 0db9562b8..e3b279fe6 100644
+--- a/log/context.go
++++ b/log/context.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 
+ 	"github.com/sirupsen/logrus"
++	"go.opencensus.io/trace"
+ )
+ 
+ var (
+@@ -57,13 +58,23 @@ func WithLogger(ctx context.Context, logger *logrus.Entry) context.Context {
+ }
+ 
+ // GetLogger retrieves the current logger from the context. If no logger is
+-// available, the default logger is returned.
++// available, the default logger is returned. If the context has a span
++// associated with it, add correlating information to the returned logger.
+ func GetLogger(ctx context.Context) *logrus.Entry {
+-	logger := ctx.Value(loggerKey{})
+-
+-	if logger == nil {
+-		return L.WithContext(ctx)
++	e, _ := ctx.Value(loggerKey{}).(*logrus.Entry)
++	if e == nil {
++		e = L
+ 	}
+-
+-	return logger.(*logrus.Entry)
++	if span := trace.FromContext(ctx); span != nil {
++		spanCtx := span.SpanContext()
++		// The field names used are are specified in the OpenCensus log
++		// correlation document, tweaked to match with general Golang naming
++		// conventions.
++		// https://github.com/census-instrumentation/opencensus-specs/blob/master/trace/LogCorrelation.md
++		e = e.WithFields(logrus.Fields{
++			"traceID": spanCtx.TraceID.String(),
++			"spanID":  spanCtx.SpanID.String(),
++		})
++	}
++	return e
+ }
+diff --git a/oc/exporter.go b/oc/exporter.go
+new file mode 100644
+index 000000000..39a55e766
+--- /dev/null
++++ b/oc/exporter.go
+@@ -0,0 +1,59 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package oc
++
++import (
++	"github.com/sirupsen/logrus"
++	"go.opencensus.io/trace"
++)
++
++var _ = (trace.Exporter)(&LogrusExporter{})
++
++// LogrusExporter is an OpenCensus `trace.Exporter` that exports
++// `trace.SpanData` to logrus output.
++type LogrusExporter struct {
++}
++
++// ExportSpan exports `s` based on the the following rules:
++//
++// 1. All output will contain `s.Attributes`, `s.TraceID`, `s.SpanID`,
++// `s.ParentSpanID` for correlation
++//
++// 2. Any calls to .Annotate will not be supported.
++//
++// 3. The span itself will be written at `logrus.InfoLevel` unless
++// `s.Status.Code != 0` in which case it will be written at `logrus.ErrorLevel`
++// providing `s.Status.Message` as the error value.
++func (le *LogrusExporter) ExportSpan(s *trace.SpanData) {
++	// Combine all span annotations with traceID, spanID, parentSpanID
++	baseEntry := logrus.WithFields(logrus.Fields(s.Attributes))
++	baseEntry.Data["traceID"] = s.TraceID.String()
++	baseEntry.Data["spanID"] = s.SpanID.String()
++	baseEntry.Data["parentSpanID"] = s.ParentSpanID.String()
++	baseEntry.Data["startTime"] = s.StartTime
++	baseEntry.Data["endTime"] = s.EndTime
++	baseEntry.Data["duration"] = s.EndTime.Sub(s.StartTime).String()
++	baseEntry.Data["name"] = s.Name
++	baseEntry.Time = s.StartTime
++
++	level := logrus.InfoLevel
++	if s.Status.Code != 0 {
++		level = logrus.ErrorLevel
++		baseEntry.Data[logrus.ErrorKey] = s.Status.Message
++	}
++	baseEntry.Log(level, "Span")
++}
+diff --git a/oc/span.go b/oc/span.go
+new file mode 100644
+index 000000000..3a287aef1
+--- /dev/null
++++ b/oc/span.go
+@@ -0,0 +1,33 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package oc
++
++import (
++	"go.opencensus.io/trace"
++)
++
++// SetSpanStatus sets `span.SetStatus` to the proper status depending on `err`. If
++// `err` is `nil` assumes `trace.StatusCodeOk`.
++func SetSpanStatus(span *trace.Span, err error) {
++	status := trace.Status{}
++	if err != nil {
++		// TODO: JTERRY75 - Handle errors in a non-generic way
++		status.Code = trace.StatusCodeUnknown
++		status.Message = err.Error()
++	}
++	span.SetStatus(status)
++}
+diff --git a/services/server/server.go b/services/server/server.go
+index 39be7593b..4acb3af35 100644
+--- a/services/server/server.go
++++ b/services/server/server.go
+@@ -56,6 +56,7 @@ import (
+ 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+ 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+ 	bolt "go.etcd.io/bbolt"
++	"go.opencensus.io/plugin/ocgrpc"
+ 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/backoff"
+@@ -141,6 +142,7 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
+ 			grpc.UnaryServerInterceptor(grpc_prometheus.UnaryServerInterceptor),
+ 			unaryNamespaceInterceptor,
+ 		)),
++		grpc.StatsHandler(&ocgrpc.ServerHandler{}),
+ 	}
+ 	if config.GRPC.MaxRecvMsgSize > 0 {
+ 		serverOpts = append(serverOpts, grpc.MaxRecvMsgSize(config.GRPC.MaxRecvMsgSize))
+diff --git a/vendor/go.opencensus.io/internal/tagencoding/tagencoding.go b/vendor/go.opencensus.io/internal/tagencoding/tagencoding.go
+new file mode 100644
+index 000000000..41b2c3fc0
+--- /dev/null
++++ b/vendor/go.opencensus.io/internal/tagencoding/tagencoding.go
+@@ -0,0 +1,75 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++// Package tagencoding contains the tag encoding
++// used interally by the stats collector.
++package tagencoding // import "go.opencensus.io/internal/tagencoding"
++
++// Values represent the encoded buffer for the values.
++type Values struct {
++	Buffer     []byte
++	WriteIndex int
++	ReadIndex  int
++}
++
++func (vb *Values) growIfRequired(expected int) {
++	if len(vb.Buffer)-vb.WriteIndex < expected {
++		tmp := make([]byte, 2*(len(vb.Buffer)+1)+expected)
++		copy(tmp, vb.Buffer)
++		vb.Buffer = tmp
++	}
++}
++
++// WriteValue is the helper method to encode Values from map[Key][]byte.
++func (vb *Values) WriteValue(v []byte) {
++	length := len(v) & 0xff
++	vb.growIfRequired(1 + length)
++
++	// writing length of v
++	vb.Buffer[vb.WriteIndex] = byte(length)
++	vb.WriteIndex++
++
++	if length == 0 {
++		// No value was encoded for this key
++		return
++	}
++
++	// writing v
++	copy(vb.Buffer[vb.WriteIndex:], v[:length])
++	vb.WriteIndex += length
++}
++
++// ReadValue is the helper method to decode Values to a map[Key][]byte.
++func (vb *Values) ReadValue() []byte {
++	// read length of v
++	length := int(vb.Buffer[vb.ReadIndex])
++	vb.ReadIndex++
++	if length == 0 {
++		// No value was encoded for this key
++		return nil
++	}
++
++	// read value of v
++	v := make([]byte, length)
++	endIdx := vb.ReadIndex + length
++	copy(v, vb.Buffer[vb.ReadIndex:endIdx])
++	vb.ReadIndex = endIdx
++	return v
++}
++
++// Bytes returns a reference to already written bytes in the Buffer.
++func (vb *Values) Bytes() []byte {
++	return vb.Buffer[:vb.WriteIndex]
++}
+diff --git a/vendor/go.opencensus.io/metric/metricdata/doc.go b/vendor/go.opencensus.io/metric/metricdata/doc.go
+new file mode 100644
+index 000000000..52a7b3bf8
+--- /dev/null
++++ b/vendor/go.opencensus.io/metric/metricdata/doc.go
+@@ -0,0 +1,19 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package metricdata contains the metrics data model.
++//
++// This is an EXPERIMENTAL package, and may change in arbitrary ways without
++// notice.
++package metricdata // import "go.opencensus.io/metric/metricdata"
+diff --git a/vendor/go.opencensus.io/metric/metricdata/exemplar.go b/vendor/go.opencensus.io/metric/metricdata/exemplar.go
+new file mode 100644
+index 000000000..12695ce2d
+--- /dev/null
++++ b/vendor/go.opencensus.io/metric/metricdata/exemplar.go
+@@ -0,0 +1,38 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package metricdata
++
++import (
++	"time"
++)
++
++// Exemplars keys.
++const (
++	AttachmentKeySpanContext = "SpanContext"
++)
++
++// Exemplar is an example data point associated with each bucket of a
++// distribution type aggregation.
++//
++// Their purpose is to provide an example of the kind of thing
++// (request, RPC, trace span, etc.) that resulted in that measurement.
++type Exemplar struct {
++	Value       float64     // the value that was recorded
++	Timestamp   time.Time   // the time the value was recorded
++	Attachments Attachments // attachments (if any)
++}
++
++// Attachments is a map of extra values associated with a recorded data point.
++type Attachments map[string]interface{}
+diff --git a/vendor/go.opencensus.io/metric/metricdata/label.go b/vendor/go.opencensus.io/metric/metricdata/label.go
+new file mode 100644
+index 000000000..aadae41e6
+--- /dev/null
++++ b/vendor/go.opencensus.io/metric/metricdata/label.go
+@@ -0,0 +1,35 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package metricdata
++
++// LabelKey represents key of a label. It has optional
++// description attribute.
++type LabelKey struct {
++	Key         string
++	Description string
++}
++
++// LabelValue represents the value of a label.
++// The zero value represents a missing label value, which may be treated
++// differently to an empty string value by some back ends.
++type LabelValue struct {
++	Value   string // string value of the label
++	Present bool   // flag that indicated whether a value is present or not
++}
++
++// NewLabelValue creates a new non-nil LabelValue that represents the given string.
++func NewLabelValue(val string) LabelValue {
++	return LabelValue{Value: val, Present: true}
++}
+diff --git a/vendor/go.opencensus.io/metric/metricdata/metric.go b/vendor/go.opencensus.io/metric/metricdata/metric.go
+new file mode 100644
+index 000000000..8293712c7
+--- /dev/null
++++ b/vendor/go.opencensus.io/metric/metricdata/metric.go
+@@ -0,0 +1,46 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package metricdata
++
++import (
++	"time"
++
++	"go.opencensus.io/resource"
++)
++
++// Descriptor holds metadata about a metric.
++type Descriptor struct {
++	Name        string     // full name of the metric
++	Description string     // human-readable description
++	Unit        Unit       // units for the measure
++	Type        Type       // type of measure
++	LabelKeys   []LabelKey // label keys
++}
++
++// Metric represents a quantity measured against a resource with different
++// label value combinations.
++type Metric struct {
++	Descriptor Descriptor         // metric descriptor
++	Resource   *resource.Resource // resource against which this was measured
++	TimeSeries []*TimeSeries      // one time series for each combination of label values
++}
++
++// TimeSeries is a sequence of points associated with a combination of label
++// values.
++type TimeSeries struct {
++	LabelValues []LabelValue // label values, same order as keys in the metric descriptor
++	Points      []Point      // points sequence
++	StartTime   time.Time    // time we started recording this time series
++}
+diff --git a/vendor/go.opencensus.io/metric/metricdata/point.go b/vendor/go.opencensus.io/metric/metricdata/point.go
+new file mode 100644
+index 000000000..7fe057b19
+--- /dev/null
++++ b/vendor/go.opencensus.io/metric/metricdata/point.go
+@@ -0,0 +1,193 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package metricdata
++
++import (
++	"time"
++)
++
++// Point is a single data point of a time series.
++type Point struct {
++	// Time is the point in time that this point represents in a time series.
++	Time time.Time
++	// Value is the value of this point. Prefer using ReadValue to switching on
++	// the value type, since new value types might be added.
++	Value interface{}
++}
++
++//go:generate stringer -type ValueType
++
++// NewFloat64Point creates a new Point holding a float64 value.
++func NewFloat64Point(t time.Time, val float64) Point {
++	return Point{
++		Value: val,
++		Time:  t,
++	}
++}
++
++// NewInt64Point creates a new Point holding an int64 value.
++func NewInt64Point(t time.Time, val int64) Point {
++	return Point{
++		Value: val,
++		Time:  t,
++	}
++}
++
++// NewDistributionPoint creates a new Point holding a Distribution value.
++func NewDistributionPoint(t time.Time, val *Distribution) Point {
++	return Point{
++		Value: val,
++		Time:  t,
++	}
++}
++
++// NewSummaryPoint creates a new Point holding a Summary value.
++func NewSummaryPoint(t time.Time, val *Summary) Point {
++	return Point{
++		Value: val,
++		Time:  t,
++	}
++}
++
++// ValueVisitor allows reading the value of a point.
++type ValueVisitor interface {
++	VisitFloat64Value(float64)
++	VisitInt64Value(int64)
++	VisitDistributionValue(*Distribution)
++	VisitSummaryValue(*Summary)
++}
++
++// ReadValue accepts a ValueVisitor and calls the appropriate method with the
++// value of this point.
++// Consumers of Point should use this in preference to switching on the type
++// of the value directly, since new value types may be added.
++func (p Point) ReadValue(vv ValueVisitor) {
++	switch v := p.Value.(type) {
++	case int64:
++		vv.VisitInt64Value(v)
++	case float64:
++		vv.VisitFloat64Value(v)
++	case *Distribution:
++		vv.VisitDistributionValue(v)
++	case *Summary:
++		vv.VisitSummaryValue(v)
++	default:
++		panic("unexpected value type")
++	}
++}
++
++// Distribution contains summary statistics for a population of values. It
++// optionally contains a histogram representing the distribution of those
++// values across a set of buckets.
++type Distribution struct {
++	// Count is the number of values in the population. Must be non-negative. This value
++	// must equal the sum of the values in bucket_counts if a histogram is
++	// provided.
++	Count int64
++	// Sum is the sum of the values in the population. If count is zero then this field
++	// must be zero.
++	Sum float64
++	// SumOfSquaredDeviation is the sum of squared deviations from the mean of the values in the
++	// population. For values x_i this is:
++	//
++	//     Sum[i=1..n]((x_i - mean)^2)
++	//
++	// Knuth, "The Art of Computer Programming", Vol. 2, page 323, 3rd edition
++	// describes Welford's method for accumulating this sum in one pass.
++	//
++	// If count is zero then this field must be zero.
++	SumOfSquaredDeviation float64
++	// BucketOptions describes the bounds of the histogram buckets in this
++	// distribution.
++	//
++	// A Distribution may optionally contain a histogram of the values in the
++	// population.
++	//
++	// If nil, there is no associated histogram.
++	BucketOptions *BucketOptions
++	// Bucket If the distribution does not have a histogram, then omit this field.
++	// If there is a histogram, then the sum of the values in the Bucket counts
++	// must equal the value in the count field of the distribution.
++	Buckets []Bucket
++}
++
++// BucketOptions describes the bounds of the histogram buckets in this
++// distribution.
++type BucketOptions struct {
++	// Bounds specifies a set of bucket upper bounds.
++	// This defines len(bounds) + 1 (= N) buckets. The boundaries for bucket
++	// index i are:
++	//
++	// [0, Bounds[i]) for i == 0
++	// [Bounds[i-1], Bounds[i]) for 0 < i < N-1
++	// [Bounds[i-1], +infinity) for i == N-1
++	Bounds []float64
++}
++
++// Bucket represents a single bucket (value range) in a distribution.
++type Bucket struct {
++	// Count is the number of values in each bucket of the histogram, as described in
++	// bucket_bounds.
++	Count int64
++	// Exemplar associated with this bucket (if any).
++	Exemplar *Exemplar
++}
++
++// Summary is a representation of percentiles.
++type Summary struct {
++	// Count is the cumulative count (if available).
++	Count int64
++	// Sum is the cumulative sum of values  (if available).
++	Sum float64
++	// HasCountAndSum is true if Count and Sum are available.
++	HasCountAndSum bool
++	// Snapshot represents percentiles calculated over an arbitrary time window.
++	// The values in this struct can be reset at arbitrary unknown times, with
++	// the requirement that all of them are reset at the same time.
++	Snapshot Snapshot
++}
++
++// Snapshot represents percentiles over an arbitrary time.
++// The values in this struct can be reset at arbitrary unknown times, with
++// the requirement that all of them are reset at the same time.
++type Snapshot struct {
++	// Count is the number of values in the snapshot. Optional since some systems don't
++	// expose this. Set to 0 if not available.
++	Count int64
++	// Sum is the sum of values in the snapshot. Optional since some systems don't
++	// expose this. If count is 0 then this field must be zero.
++	Sum float64
++	// Percentiles is a map from percentile (range (0-100.0]) to the value of
++	// the percentile.
++	Percentiles map[float64]float64
++}
++
++//go:generate stringer -type Type
++
++// Type is the overall type of metric, including its value type and whether it
++// represents a cumulative total (since the start time) or if it represents a
++// gauge value.
++type Type int
++
++// Metric types.
++const (
++	TypeGaugeInt64 Type = iota
++	TypeGaugeFloat64
++	TypeGaugeDistribution
++	TypeCumulativeInt64
++	TypeCumulativeFloat64
++	TypeCumulativeDistribution
++	TypeSummary
++)
+diff --git a/vendor/go.opencensus.io/metric/metricdata/type_string.go b/vendor/go.opencensus.io/metric/metricdata/type_string.go
+new file mode 100644
+index 000000000..c3f8ec27b
+--- /dev/null
++++ b/vendor/go.opencensus.io/metric/metricdata/type_string.go
+@@ -0,0 +1,16 @@
++// Code generated by "stringer -type Type"; DO NOT EDIT.
++
++package metricdata
++
++import "strconv"
++
++const _Type_name = "TypeGaugeInt64TypeGaugeFloat64TypeGaugeDistributionTypeCumulativeInt64TypeCumulativeFloat64TypeCumulativeDistributionTypeSummary"
++
++var _Type_index = [...]uint8{0, 14, 30, 51, 70, 91, 117, 128}
++
++func (i Type) String() string {
++	if i < 0 || i >= Type(len(_Type_index)-1) {
++		return "Type(" + strconv.FormatInt(int64(i), 10) + ")"
++	}
++	return _Type_name[_Type_index[i]:_Type_index[i+1]]
++}
+diff --git a/vendor/go.opencensus.io/metric/metricdata/unit.go b/vendor/go.opencensus.io/metric/metricdata/unit.go
+new file mode 100644
+index 000000000..b483a1371
+--- /dev/null
++++ b/vendor/go.opencensus.io/metric/metricdata/unit.go
+@@ -0,0 +1,27 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package metricdata
++
++// Unit is a string encoded according to the case-sensitive abbreviations from the
++// Unified Code for Units of Measure: http://unitsofmeasure.org/ucum.html
++type Unit string
++
++// Predefined units. To record against a unit not represented here, create your
++// own Unit type constant from a string.
++const (
++	UnitDimensionless Unit = "1"
++	UnitBytes         Unit = "By"
++	UnitMilliseconds  Unit = "ms"
++)
+diff --git a/vendor/go.opencensus.io/metric/metricproducer/manager.go b/vendor/go.opencensus.io/metric/metricproducer/manager.go
+new file mode 100644
+index 000000000..ca1f39049
+--- /dev/null
++++ b/vendor/go.opencensus.io/metric/metricproducer/manager.go
+@@ -0,0 +1,78 @@
++// Copyright 2019, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package metricproducer
++
++import (
++	"sync"
++)
++
++// Manager maintains a list of active producers. Producers can register
++// with the manager to allow readers to read all metrics provided by them.
++// Readers can retrieve all producers registered with the manager,
++// read metrics from the producers and export them.
++type Manager struct {
++	mu        sync.RWMutex
++	producers map[Producer]struct{}
++}
++
++var prodMgr *Manager
++var once sync.Once
++
++// GlobalManager is a single instance of producer manager
++// that is used by all producers and all readers.
++func GlobalManager() *Manager {
++	once.Do(func() {
++		prodMgr = &Manager{}
++		prodMgr.producers = make(map[Producer]struct{})
++	})
++	return prodMgr
++}
++
++// AddProducer adds the producer to the Manager if it is not already present.
++func (pm *Manager) AddProducer(producer Producer) {
++	if producer == nil {
++		return
++	}
++	pm.mu.Lock()
++	defer pm.mu.Unlock()
++	pm.producers[producer] = struct{}{}
++}
++
++// DeleteProducer deletes the producer from the Manager if it is present.
++func (pm *Manager) DeleteProducer(producer Producer) {
++	if producer == nil {
++		return
++	}
++	pm.mu.Lock()
++	defer pm.mu.Unlock()
++	delete(pm.producers, producer)
++}
++
++// GetAll returns a slice of all producer currently registered with
++// the Manager. For each call it generates a new slice. The slice
++// should not be cached as registration may change at any time. It is
++// typically called periodically by exporter to read metrics from
++// the producers.
++func (pm *Manager) GetAll() []Producer {
++	pm.mu.Lock()
++	defer pm.mu.Unlock()
++	producers := make([]Producer, len(pm.producers))
++	i := 0
++	for producer := range pm.producers {
++		producers[i] = producer
++		i++
++	}
++	return producers
++}
+diff --git a/vendor/go.opencensus.io/metric/metricproducer/producer.go b/vendor/go.opencensus.io/metric/metricproducer/producer.go
+new file mode 100644
+index 000000000..6cee9ed17
+--- /dev/null
++++ b/vendor/go.opencensus.io/metric/metricproducer/producer.go
+@@ -0,0 +1,28 @@
++// Copyright 2019, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package metricproducer
++
++import (
++	"go.opencensus.io/metric/metricdata"
++)
++
++// Producer is a source of metrics.
++type Producer interface {
++	// Read should return the current values of all metrics supported by this
++	// metric provider.
++	// The returned metrics should be unique for each combination of name and
++	// resource.
++	Read() []*metricdata.Metric
++}
+diff --git a/vendor/go.opencensus.io/plugin/ocgrpc/client.go b/vendor/go.opencensus.io/plugin/ocgrpc/client.go
+new file mode 100644
+index 000000000..2063b6f76
+--- /dev/null
++++ b/vendor/go.opencensus.io/plugin/ocgrpc/client.go
+@@ -0,0 +1,56 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package ocgrpc
++
++import (
++	"context"
++
++	"go.opencensus.io/trace"
++	"google.golang.org/grpc/stats"
++)
++
++// ClientHandler implements a gRPC stats.Handler for recording OpenCensus stats and
++// traces. Use with gRPC clients only.
++type ClientHandler struct {
++	// StartOptions allows configuring the StartOptions used to create new spans.
++	//
++	// StartOptions.SpanKind will always be set to trace.SpanKindClient
++	// for spans started by this handler.
++	StartOptions trace.StartOptions
++}
++
++// HandleConn exists to satisfy gRPC stats.Handler.
++func (c *ClientHandler) HandleConn(ctx context.Context, cs stats.ConnStats) {
++	// no-op
++}
++
++// TagConn exists to satisfy gRPC stats.Handler.
++func (c *ClientHandler) TagConn(ctx context.Context, cti *stats.ConnTagInfo) context.Context {
++	// no-op
++	return ctx
++}
++
++// HandleRPC implements per-RPC tracing and stats instrumentation.
++func (c *ClientHandler) HandleRPC(ctx context.Context, rs stats.RPCStats) {
++	traceHandleRPC(ctx, rs)
++	statsHandleRPC(ctx, rs)
++}
++
++// TagRPC implements per-RPC context management.
++func (c *ClientHandler) TagRPC(ctx context.Context, rti *stats.RPCTagInfo) context.Context {
++	ctx = c.traceTagRPC(ctx, rti)
++	ctx = c.statsTagRPC(ctx, rti)
++	return ctx
++}
+diff --git a/vendor/go.opencensus.io/plugin/ocgrpc/client_metrics.go b/vendor/go.opencensus.io/plugin/ocgrpc/client_metrics.go
+new file mode 100644
+index 000000000..49fde3d8c
+--- /dev/null
++++ b/vendor/go.opencensus.io/plugin/ocgrpc/client_metrics.go
+@@ -0,0 +1,109 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package ocgrpc
++
++import (
++	"go.opencensus.io/stats"
++	"go.opencensus.io/stats/view"
++	"go.opencensus.io/tag"
++)
++
++// The following variables are measures are recorded by ClientHandler:
++var (
++	ClientSentMessagesPerRPC     = stats.Int64("grpc.io/client/sent_messages_per_rpc", "Number of messages sent in the RPC (always 1 for non-streaming RPCs).", stats.UnitDimensionless)
++	ClientSentBytesPerRPC        = stats.Int64("grpc.io/client/sent_bytes_per_rpc", "Total bytes sent across all request messages per RPC.", stats.UnitBytes)
++	ClientReceivedMessagesPerRPC = stats.Int64("grpc.io/client/received_messages_per_rpc", "Number of response messages received per RPC (always 1 for non-streaming RPCs).", stats.UnitDimensionless)
++	ClientReceivedBytesPerRPC    = stats.Int64("grpc.io/client/received_bytes_per_rpc", "Total bytes received across all response messages per RPC.", stats.UnitBytes)
++	ClientRoundtripLatency       = stats.Float64("grpc.io/client/roundtrip_latency", "Time between first byte of request sent to last byte of response received, or terminal error.", stats.UnitMilliseconds)
++	ClientServerLatency          = stats.Float64("grpc.io/client/server_latency", `Propagated from the server and should have the same value as "grpc.io/server/latency".`, stats.UnitMilliseconds)
++)
++
++// Predefined views may be registered to collect data for the above measures.
++// As always, you may also define your own custom views over measures collected by this
++// package. These are declared as a convenience only; none are registered by
++// default.
++var (
++	ClientSentBytesPerRPCView = &view.View{
++		Measure:     ClientSentBytesPerRPC,
++		Name:        "grpc.io/client/sent_bytes_per_rpc",
++		Description: "Distribution of bytes sent per RPC, by method.",
++		TagKeys:     []tag.Key{KeyClientMethod},
++		Aggregation: DefaultBytesDistribution,
++	}
++
++	ClientReceivedBytesPerRPCView = &view.View{
++		Measure:     ClientReceivedBytesPerRPC,
++		Name:        "grpc.io/client/received_bytes_per_rpc",
++		Description: "Distribution of bytes received per RPC, by method.",
++		TagKeys:     []tag.Key{KeyClientMethod},
++		Aggregation: DefaultBytesDistribution,
++	}
++
++	ClientRoundtripLatencyView = &view.View{
++		Measure:     ClientRoundtripLatency,
++		Name:        "grpc.io/client/roundtrip_latency",
++		Description: "Distribution of round-trip latency, by method.",
++		TagKeys:     []tag.Key{KeyClientMethod},
++		Aggregation: DefaultMillisecondsDistribution,
++	}
++
++	// Purposely reuses the count from `ClientRoundtripLatency`, tagging
++	// with method and status to result in ClientCompletedRpcs.
++	ClientCompletedRPCsView = &view.View{
++		Measure:     ClientRoundtripLatency,
++		Name:        "grpc.io/client/completed_rpcs",
++		Description: "Count of RPCs by method and status.",
++		TagKeys:     []tag.Key{KeyClientMethod, KeyClientStatus},
++		Aggregation: view.Count(),
++	}
++
++	ClientSentMessagesPerRPCView = &view.View{
++		Measure:     ClientSentMessagesPerRPC,
++		Name:        "grpc.io/client/sent_messages_per_rpc",
++		Description: "Distribution of sent messages count per RPC, by method.",
++		TagKeys:     []tag.Key{KeyClientMethod},
++		Aggregation: DefaultMessageCountDistribution,
++	}
++
++	ClientReceivedMessagesPerRPCView = &view.View{
++		Measure:     ClientReceivedMessagesPerRPC,
++		Name:        "grpc.io/client/received_messages_per_rpc",
++		Description: "Distribution of received messages count per RPC, by method.",
++		TagKeys:     []tag.Key{KeyClientMethod},
++		Aggregation: DefaultMessageCountDistribution,
++	}
++
++	ClientServerLatencyView = &view.View{
++		Measure:     ClientServerLatency,
++		Name:        "grpc.io/client/server_latency",
++		Description: "Distribution of server latency as viewed by client, by method.",
++		TagKeys:     []tag.Key{KeyClientMethod},
++		Aggregation: DefaultMillisecondsDistribution,
++	}
++)
++
++// DefaultClientViews are the default client views provided by this package.
++var DefaultClientViews = []*view.View{
++	ClientSentBytesPerRPCView,
++	ClientReceivedBytesPerRPCView,
++	ClientRoundtripLatencyView,
++	ClientCompletedRPCsView,
++}
++
++// TODO(jbd): Add roundtrip_latency, uncompressed_request_bytes, uncompressed_response_bytes, request_count, response_count.
++// TODO(acetechnologist): This is temporary and will need to be replaced by a
++// mechanism to load these defaults from a common repository/config shared by
++// all supported languages. Likely a serialized protobuf of these defaults.
+diff --git a/vendor/go.opencensus.io/plugin/ocgrpc/client_stats_handler.go b/vendor/go.opencensus.io/plugin/ocgrpc/client_stats_handler.go
+new file mode 100644
+index 000000000..b36349820
+--- /dev/null
++++ b/vendor/go.opencensus.io/plugin/ocgrpc/client_stats_handler.go
+@@ -0,0 +1,49 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package ocgrpc
++
++import (
++	"context"
++	"time"
++
++	"go.opencensus.io/tag"
++	"google.golang.org/grpc/grpclog"
++	"google.golang.org/grpc/stats"
++)
++
++// statsTagRPC gets the tag.Map populated by the application code, serializes
++// its tags into the GRPC metadata in order to be sent to the server.
++func (h *ClientHandler) statsTagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
++	startTime := time.Now()
++	if info == nil {
++		if grpclog.V(2) {
++			grpclog.Info("clientHandler.TagRPC called with nil info.")
++		}
++		return ctx
++	}
++
++	d := &rpcData{
++		startTime: startTime,
++		method:    info.FullMethodName,
++	}
++	ts := tag.FromContext(ctx)
++	if ts != nil {
++		encoded := tag.Encode(ts)
++		ctx = stats.SetTags(ctx, encoded)
++	}
++
++	return context.WithValue(ctx, rpcDataKey, d)
++}
+diff --git a/vendor/go.opencensus.io/plugin/ocgrpc/doc.go b/vendor/go.opencensus.io/plugin/ocgrpc/doc.go
+new file mode 100644
+index 000000000..1370323fb
+--- /dev/null
++++ b/vendor/go.opencensus.io/plugin/ocgrpc/doc.go
+@@ -0,0 +1,19 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package ocgrpc contains OpenCensus stats and trace
++// integrations for gRPC.
++//
++// Use ServerHandler for servers and ClientHandler for clients.
++package ocgrpc // import "go.opencensus.io/plugin/ocgrpc"
+diff --git a/vendor/go.opencensus.io/plugin/ocgrpc/server.go b/vendor/go.opencensus.io/plugin/ocgrpc/server.go
+new file mode 100644
+index 000000000..8a53e0972
+--- /dev/null
++++ b/vendor/go.opencensus.io/plugin/ocgrpc/server.go
+@@ -0,0 +1,81 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package ocgrpc
++
++import (
++	"context"
++
++	"google.golang.org/grpc/stats"
++
++	"go.opencensus.io/trace"
++)
++
++// ServerHandler implements gRPC stats.Handler recording OpenCensus stats and
++// traces. Use with gRPC servers.
++//
++// When installed (see Example), tracing metadata is read from inbound RPCs
++// by default. If no tracing metadata is present, or if the tracing metadata is
++// present but the SpanContext isn't sampled, then a new trace may be started
++// (as determined by Sampler).
++type ServerHandler struct {
++	// IsPublicEndpoint may be set to true to always start a new trace around
++	// each RPC. Any SpanContext in the RPC metadata will be added as a linked
++	// span instead of making it the parent of the span created around the
++	// server RPC.
++	//
++	// Be aware that if you leave this false (the default) on a public-facing
++	// server, callers will be able to send tracing metadata in gRPC headers
++	// and trigger traces in your backend.
++	IsPublicEndpoint bool
++
++	// StartOptions to use for to spans started around RPCs handled by this server.
++	//
++	// These will apply even if there is tracing metadata already
++	// present on the inbound RPC but the SpanContext is not sampled. This
++	// ensures that each service has some opportunity to be traced. If you would
++	// like to not add any additional traces for this gRPC service, set:
++	//
++	//   StartOptions.Sampler = trace.ProbabilitySampler(0.0)
++	//
++	// StartOptions.SpanKind will always be set to trace.SpanKindServer
++	// for spans started by this handler.
++	StartOptions trace.StartOptions
++}
++
++var _ stats.Handler = (*ServerHandler)(nil)
++
++// HandleConn exists to satisfy gRPC stats.Handler.
++func (s *ServerHandler) HandleConn(ctx context.Context, cs stats.ConnStats) {
++	// no-op
++}
++
++// TagConn exists to satisfy gRPC stats.Handler.
++func (s *ServerHandler) TagConn(ctx context.Context, cti *stats.ConnTagInfo) context.Context {
++	// no-op
++	return ctx
++}
++
++// HandleRPC implements per-RPC tracing and stats instrumentation.
++func (s *ServerHandler) HandleRPC(ctx context.Context, rs stats.RPCStats) {
++	traceHandleRPC(ctx, rs)
++	statsHandleRPC(ctx, rs)
++}
++
++// TagRPC implements per-RPC context management.
++func (s *ServerHandler) TagRPC(ctx context.Context, rti *stats.RPCTagInfo) context.Context {
++	ctx = s.traceTagRPC(ctx, rti)
++	ctx = s.statsTagRPC(ctx, rti)
++	return ctx
++}
+diff --git a/vendor/go.opencensus.io/plugin/ocgrpc/server_metrics.go b/vendor/go.opencensus.io/plugin/ocgrpc/server_metrics.go
+new file mode 100644
+index 000000000..b2059824a
+--- /dev/null
++++ b/vendor/go.opencensus.io/plugin/ocgrpc/server_metrics.go
+@@ -0,0 +1,99 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package ocgrpc
++
++import (
++	"go.opencensus.io/stats"
++	"go.opencensus.io/stats/view"
++	"go.opencensus.io/tag"
++)
++
++// The following variables are measures are recorded by ServerHandler:
++var (
++	ServerReceivedMessagesPerRPC = stats.Int64("grpc.io/server/received_messages_per_rpc", "Number of messages received in each RPC. Has value 1 for non-streaming RPCs.", stats.UnitDimensionless)
++	ServerReceivedBytesPerRPC    = stats.Int64("grpc.io/server/received_bytes_per_rpc", "Total bytes received across all messages per RPC.", stats.UnitBytes)
++	ServerSentMessagesPerRPC     = stats.Int64("grpc.io/server/sent_messages_per_rpc", "Number of messages sent in each RPC. Has value 1 for non-streaming RPCs.", stats.UnitDimensionless)
++	ServerSentBytesPerRPC        = stats.Int64("grpc.io/server/sent_bytes_per_rpc", "Total bytes sent in across all response messages per RPC.", stats.UnitBytes)
++	ServerLatency                = stats.Float64("grpc.io/server/server_latency", "Time between first byte of request received to last byte of response sent, or terminal error.", stats.UnitMilliseconds)
++)
++
++// TODO(acetechnologist): This is temporary and will need to be replaced by a
++// mechanism to load these defaults from a common repository/config shared by
++// all supported languages. Likely a serialized protobuf of these defaults.
++
++// Predefined views may be registered to collect data for the above measures.
++// As always, you may also define your own custom views over measures collected by this
++// package. These are declared as a convenience only; none are registered by
++// default.
++var (
++	ServerReceivedBytesPerRPCView = &view.View{
++		Name:        "grpc.io/server/received_bytes_per_rpc",
++		Description: "Distribution of received bytes per RPC, by method.",
++		Measure:     ServerReceivedBytesPerRPC,
++		TagKeys:     []tag.Key{KeyServerMethod},
++		Aggregation: DefaultBytesDistribution,
++	}
++
++	ServerSentBytesPerRPCView = &view.View{
++		Name:        "grpc.io/server/sent_bytes_per_rpc",
++		Description: "Distribution of total sent bytes per RPC, by method.",
++		Measure:     ServerSentBytesPerRPC,
++		TagKeys:     []tag.Key{KeyServerMethod},
++		Aggregation: DefaultBytesDistribution,
++	}
++
++	ServerLatencyView = &view.View{
++		Name:        "grpc.io/server/server_latency",
++		Description: "Distribution of server latency in milliseconds, by method.",
++		TagKeys:     []tag.Key{KeyServerMethod},
++		Measure:     ServerLatency,
++		Aggregation: DefaultMillisecondsDistribution,
++	}
++
++	// Purposely reuses the count from `ServerLatency`, tagging
++	// with method and status to result in ServerCompletedRpcs.
++	ServerCompletedRPCsView = &view.View{
++		Name:        "grpc.io/server/completed_rpcs",
++		Description: "Count of RPCs by method and status.",
++		TagKeys:     []tag.Key{KeyServerMethod, KeyServerStatus},
++		Measure:     ServerLatency,
++		Aggregation: view.Count(),
++	}
++
++	ServerReceivedMessagesPerRPCView = &view.View{
++		Name:        "grpc.io/server/received_messages_per_rpc",
++		Description: "Distribution of messages received count per RPC, by method.",
++		TagKeys:     []tag.Key{KeyServerMethod},
++		Measure:     ServerReceivedMessagesPerRPC,
++		Aggregation: DefaultMessageCountDistribution,
++	}
++
++	ServerSentMessagesPerRPCView = &view.View{
++		Name:        "grpc.io/server/sent_messages_per_rpc",
++		Description: "Distribution of messages sent count per RPC, by method.",
++		TagKeys:     []tag.Key{KeyServerMethod},
++		Measure:     ServerSentMessagesPerRPC,
++		Aggregation: DefaultMessageCountDistribution,
++	}
++)
++
++// DefaultServerViews are the default server views provided by this package.
++var DefaultServerViews = []*view.View{
++	ServerReceivedBytesPerRPCView,
++	ServerSentBytesPerRPCView,
++	ServerLatencyView,
++	ServerCompletedRPCsView,
++}
+diff --git a/vendor/go.opencensus.io/plugin/ocgrpc/server_stats_handler.go b/vendor/go.opencensus.io/plugin/ocgrpc/server_stats_handler.go
+new file mode 100644
+index 000000000..afcef023a
+--- /dev/null
++++ b/vendor/go.opencensus.io/plugin/ocgrpc/server_stats_handler.go
+@@ -0,0 +1,63 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package ocgrpc
++
++import (
++	"time"
++
++	"context"
++
++	"go.opencensus.io/tag"
++	"google.golang.org/grpc/grpclog"
++	"google.golang.org/grpc/stats"
++)
++
++// statsTagRPC gets the metadata from gRPC context, extracts the encoded tags from
++// it and creates a new tag.Map and puts them into the returned context.
++func (h *ServerHandler) statsTagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
++	startTime := time.Now()
++	if info == nil {
++		if grpclog.V(2) {
++			grpclog.Infof("opencensus: TagRPC called with nil info.")
++		}
++		return ctx
++	}
++	d := &rpcData{
++		startTime: startTime,
++		method:    info.FullMethodName,
++	}
++	propagated := h.extractPropagatedTags(ctx)
++	ctx = tag.NewContext(ctx, propagated)
++	ctx, _ = tag.New(ctx, tag.Upsert(KeyServerMethod, methodName(info.FullMethodName)))
++	return context.WithValue(ctx, rpcDataKey, d)
++}
++
++// extractPropagatedTags creates a new tag map containing the tags extracted from the
++// gRPC metadata.
++func (h *ServerHandler) extractPropagatedTags(ctx context.Context) *tag.Map {
++	buf := stats.Tags(ctx)
++	if buf == nil {
++		return nil
++	}
++	propagated, err := tag.Decode(buf)
++	if err != nil {
++		if grpclog.V(2) {
++			grpclog.Warningf("opencensus: Failed to decode tags from gRPC metadata failed to decode: %v", err)
++		}
++		return nil
++	}
++	return propagated
++}
+diff --git a/vendor/go.opencensus.io/plugin/ocgrpc/stats_common.go b/vendor/go.opencensus.io/plugin/ocgrpc/stats_common.go
+new file mode 100644
+index 000000000..89cac9c4e
+--- /dev/null
++++ b/vendor/go.opencensus.io/plugin/ocgrpc/stats_common.go
+@@ -0,0 +1,227 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package ocgrpc
++
++import (
++	"context"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"go.opencensus.io/metric/metricdata"
++	ocstats "go.opencensus.io/stats"
++	"go.opencensus.io/stats/view"
++	"go.opencensus.io/tag"
++	"go.opencensus.io/trace"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/grpclog"
++	"google.golang.org/grpc/stats"
++	"google.golang.org/grpc/status"
++)
++
++type grpcInstrumentationKey string
++
++// rpcData holds the instrumentation RPC data that is needed between the start
++// and end of an call. It holds the info that this package needs to keep track
++// of between the various GRPC events.
++type rpcData struct {
++	// reqCount and respCount has to be the first words
++	// in order to be 64-aligned on 32-bit architectures.
++	sentCount, sentBytes, recvCount, recvBytes int64 // access atomically
++
++	// startTime represents the time at which TagRPC was invoked at the
++	// beginning of an RPC. It is an appoximation of the time when the
++	// application code invoked GRPC code.
++	startTime time.Time
++	method    string
++}
++
++// The following variables define the default hard-coded auxiliary data used by
++// both the default GRPC client and GRPC server metrics.
++var (
++	DefaultBytesDistribution        = view.Distribution(1024, 2048, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864, 268435456, 1073741824, 4294967296)
++	DefaultMillisecondsDistribution = view.Distribution(0.01, 0.05, 0.1, 0.3, 0.6, 0.8, 1, 2, 3, 4, 5, 6, 8, 10, 13, 16, 20, 25, 30, 40, 50, 65, 80, 100, 130, 160, 200, 250, 300, 400, 500, 650, 800, 1000, 2000, 5000, 10000, 20000, 50000, 100000)
++	DefaultMessageCountDistribution = view.Distribution(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)
++)
++
++// Server tags are applied to the context used to process each RPC, as well as
++// the measures at the end of each RPC.
++var (
++	KeyServerMethod = tag.MustNewKey("grpc_server_method")
++	KeyServerStatus = tag.MustNewKey("grpc_server_status")
++)
++
++// Client tags are applied to measures at the end of each RPC.
++var (
++	KeyClientMethod = tag.MustNewKey("grpc_client_method")
++	KeyClientStatus = tag.MustNewKey("grpc_client_status")
++)
++
++var (
++	rpcDataKey = grpcInstrumentationKey("opencensus-rpcData")
++)
++
++func methodName(fullname string) string {
++	return strings.TrimLeft(fullname, "/")
++}
++
++// statsHandleRPC processes the RPC events.
++func statsHandleRPC(ctx context.Context, s stats.RPCStats) {
++	switch st := s.(type) {
++	case *stats.Begin, *stats.OutHeader, *stats.InHeader, *stats.InTrailer, *stats.OutTrailer:
++		// do nothing for client
++	case *stats.OutPayload:
++		handleRPCOutPayload(ctx, st)
++	case *stats.InPayload:
++		handleRPCInPayload(ctx, st)
++	case *stats.End:
++		handleRPCEnd(ctx, st)
++	default:
++		grpclog.Infof("unexpected stats: %T", st)
++	}
++}
++
++func handleRPCOutPayload(ctx context.Context, s *stats.OutPayload) {
++	d, ok := ctx.Value(rpcDataKey).(*rpcData)
++	if !ok {
++		if grpclog.V(2) {
++			grpclog.Infoln("Failed to retrieve *rpcData from context.")
++		}
++		return
++	}
++
++	atomic.AddInt64(&d.sentBytes, int64(s.Length))
++	atomic.AddInt64(&d.sentCount, 1)
++}
++
++func handleRPCInPayload(ctx context.Context, s *stats.InPayload) {
++	d, ok := ctx.Value(rpcDataKey).(*rpcData)
++	if !ok {
++		if grpclog.V(2) {
++			grpclog.Infoln("Failed to retrieve *rpcData from context.")
++		}
++		return
++	}
++
++	atomic.AddInt64(&d.recvBytes, int64(s.Length))
++	atomic.AddInt64(&d.recvCount, 1)
++}
++
++func handleRPCEnd(ctx context.Context, s *stats.End) {
++	d, ok := ctx.Value(rpcDataKey).(*rpcData)
++	if !ok {
++		if grpclog.V(2) {
++			grpclog.Infoln("Failed to retrieve *rpcData from context.")
++		}
++		return
++	}
++
++	elapsedTime := time.Since(d.startTime)
++
++	var st string
++	if s.Error != nil {
++		s, ok := status.FromError(s.Error)
++		if ok {
++			st = statusCodeToString(s)
++		}
++	} else {
++		st = "OK"
++	}
++
++	latencyMillis := float64(elapsedTime) / float64(time.Millisecond)
++	attachments := getSpanCtxAttachment(ctx)
++	if s.Client {
++		ocstats.RecordWithOptions(ctx,
++			ocstats.WithTags(
++				tag.Upsert(KeyClientMethod, methodName(d.method)),
++				tag.Upsert(KeyClientStatus, st)),
++			ocstats.WithAttachments(attachments),
++			ocstats.WithMeasurements(
++				ClientSentBytesPerRPC.M(atomic.LoadInt64(&d.sentBytes)),
++				ClientSentMessagesPerRPC.M(atomic.LoadInt64(&d.sentCount)),
++				ClientReceivedMessagesPerRPC.M(atomic.LoadInt64(&d.recvCount)),
++				ClientReceivedBytesPerRPC.M(atomic.LoadInt64(&d.recvBytes)),
++				ClientRoundtripLatency.M(latencyMillis)))
++	} else {
++		ocstats.RecordWithOptions(ctx,
++			ocstats.WithTags(
++				tag.Upsert(KeyServerStatus, st),
++			),
++			ocstats.WithAttachments(attachments),
++			ocstats.WithMeasurements(
++				ServerSentBytesPerRPC.M(atomic.LoadInt64(&d.sentBytes)),
++				ServerSentMessagesPerRPC.M(atomic.LoadInt64(&d.sentCount)),
++				ServerReceivedMessagesPerRPC.M(atomic.LoadInt64(&d.recvCount)),
++				ServerReceivedBytesPerRPC.M(atomic.LoadInt64(&d.recvBytes)),
++				ServerLatency.M(latencyMillis)))
++	}
++}
++
++func statusCodeToString(s *status.Status) string {
++	// see https://github.com/grpc/grpc/blob/master/doc/statuscodes.md
++	switch c := s.Code(); c {
++	case codes.OK:
++		return "OK"
++	case codes.Canceled:
++		return "CANCELLED"
++	case codes.Unknown:
++		return "UNKNOWN"
++	case codes.InvalidArgument:
++		return "INVALID_ARGUMENT"
++	case codes.DeadlineExceeded:
++		return "DEADLINE_EXCEEDED"
++	case codes.NotFound:
++		return "NOT_FOUND"
++	case codes.AlreadyExists:
++		return "ALREADY_EXISTS"
++	case codes.PermissionDenied:
++		return "PERMISSION_DENIED"
++	case codes.ResourceExhausted:
++		return "RESOURCE_EXHAUSTED"
++	case codes.FailedPrecondition:
++		return "FAILED_PRECONDITION"
++	case codes.Aborted:
++		return "ABORTED"
++	case codes.OutOfRange:
++		return "OUT_OF_RANGE"
++	case codes.Unimplemented:
++		return "UNIMPLEMENTED"
++	case codes.Internal:
++		return "INTERNAL"
++	case codes.Unavailable:
++		return "UNAVAILABLE"
++	case codes.DataLoss:
++		return "DATA_LOSS"
++	case codes.Unauthenticated:
++		return "UNAUTHENTICATED"
++	default:
++		return "CODE_" + strconv.FormatInt(int64(c), 10)
++	}
++}
++
++func getSpanCtxAttachment(ctx context.Context) metricdata.Attachments {
++	attachments := map[string]interface{}{}
++	span := trace.FromContext(ctx)
++	if span == nil {
++		return attachments
++	}
++	spanCtx := span.SpanContext()
++	if spanCtx.IsSampled() {
++		attachments[metricdata.AttachmentKeySpanContext] = spanCtx
++	}
++	return attachments
++}
+diff --git a/vendor/go.opencensus.io/plugin/ocgrpc/trace_common.go b/vendor/go.opencensus.io/plugin/ocgrpc/trace_common.go
+new file mode 100644
+index 000000000..61bc543d0
+--- /dev/null
++++ b/vendor/go.opencensus.io/plugin/ocgrpc/trace_common.go
+@@ -0,0 +1,107 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package ocgrpc
++
++import (
++	"context"
++	"strings"
++
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/stats"
++	"google.golang.org/grpc/status"
++
++	"go.opencensus.io/trace"
++	"go.opencensus.io/trace/propagation"
++)
++
++const traceContextKey = "grpc-trace-bin"
++
++// TagRPC creates a new trace span for the client side of the RPC.
++//
++// It returns ctx with the new trace span added and a serialization of the
++// SpanContext added to the outgoing gRPC metadata.
++func (c *ClientHandler) traceTagRPC(ctx context.Context, rti *stats.RPCTagInfo) context.Context {
++	name := strings.TrimPrefix(rti.FullMethodName, "/")
++	name = strings.Replace(name, "/", ".", -1)
++	ctx, span := trace.StartSpan(ctx, name,
++		trace.WithSampler(c.StartOptions.Sampler),
++		trace.WithSpanKind(trace.SpanKindClient)) // span is ended by traceHandleRPC
++	traceContextBinary := propagation.Binary(span.SpanContext())
++	return metadata.AppendToOutgoingContext(ctx, traceContextKey, string(traceContextBinary))
++}
++
++// TagRPC creates a new trace span for the server side of the RPC.
++//
++// It checks the incoming gRPC metadata in ctx for a SpanContext, and if
++// it finds one, uses that SpanContext as the parent context of the new span.
++//
++// It returns ctx, with the new trace span added.
++func (s *ServerHandler) traceTagRPC(ctx context.Context, rti *stats.RPCTagInfo) context.Context {
++	md, _ := metadata.FromIncomingContext(ctx)
++	name := strings.TrimPrefix(rti.FullMethodName, "/")
++	name = strings.Replace(name, "/", ".", -1)
++	traceContext := md[traceContextKey]
++	var (
++		parent     trace.SpanContext
++		haveParent bool
++	)
++	if len(traceContext) > 0 {
++		// Metadata with keys ending in -bin are actually binary. They are base64
++		// encoded before being put on the wire, see:
++		// https://github.com/grpc/grpc-go/blob/08d6261/Documentation/grpc-metadata.md#storing-binary-data-in-metadata
++		traceContextBinary := []byte(traceContext[0])
++		parent, haveParent = propagation.FromBinary(traceContextBinary)
++		if haveParent && !s.IsPublicEndpoint {
++			ctx, _ := trace.StartSpanWithRemoteParent(ctx, name, parent,
++				trace.WithSpanKind(trace.SpanKindServer),
++				trace.WithSampler(s.StartOptions.Sampler),
++			)
++			return ctx
++		}
++	}
++	ctx, span := trace.StartSpan(ctx, name,
++		trace.WithSpanKind(trace.SpanKindServer),
++		trace.WithSampler(s.StartOptions.Sampler))
++	if haveParent {
++		span.AddLink(trace.Link{TraceID: parent.TraceID, SpanID: parent.SpanID, Type: trace.LinkTypeChild})
++	}
++	return ctx
++}
++
++func traceHandleRPC(ctx context.Context, rs stats.RPCStats) {
++	span := trace.FromContext(ctx)
++	// TODO: compressed and uncompressed sizes are not populated in every message.
++	switch rs := rs.(type) {
++	case *stats.Begin:
++		span.AddAttributes(
++			trace.BoolAttribute("Client", rs.Client),
++			trace.BoolAttribute("FailFast", rs.FailFast))
++	case *stats.InPayload:
++		span.AddMessageReceiveEvent(0 /* TODO: messageID */, int64(rs.Length), int64(rs.WireLength))
++	case *stats.OutPayload:
++		span.AddMessageSendEvent(0, int64(rs.Length), int64(rs.WireLength))
++	case *stats.End:
++		if rs.Error != nil {
++			s, ok := status.FromError(rs.Error)
++			if ok {
++				span.SetStatus(trace.Status{Code: int32(s.Code()), Message: s.Message()})
++			} else {
++				span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: rs.Error.Error()})
++			}
++		}
++		span.End()
++	}
++}
+diff --git a/vendor/go.opencensus.io/resource/resource.go b/vendor/go.opencensus.io/resource/resource.go
+new file mode 100644
+index 000000000..b1764e1d3
+--- /dev/null
++++ b/vendor/go.opencensus.io/resource/resource.go
+@@ -0,0 +1,164 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package resource provides functionality for resource, which capture
++// identifying information about the entities for which signals are exported.
++package resource
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"regexp"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++// Environment variables used by FromEnv to decode a resource.
++const (
++	EnvVarType   = "OC_RESOURCE_TYPE"
++	EnvVarLabels = "OC_RESOURCE_LABELS"
++)
++
++// Resource describes an entity about which identifying information and metadata is exposed.
++// For example, a type "k8s.io/container" may hold labels describing the pod name and namespace.
++type Resource struct {
++	Type   string
++	Labels map[string]string
++}
++
++// EncodeLabels encodes a labels map to a string as provided via the OC_RESOURCE_LABELS environment variable.
++func EncodeLabels(labels map[string]string) string {
++	sortedKeys := make([]string, 0, len(labels))
++	for k := range labels {
++		sortedKeys = append(sortedKeys, k)
++	}
++	sort.Strings(sortedKeys)
++
++	s := ""
++	for i, k := range sortedKeys {
++		if i > 0 {
++			s += ","
++		}
++		s += k + "=" + strconv.Quote(labels[k])
++	}
++	return s
++}
++
++var labelRegex = regexp.MustCompile(`^\s*([[:ascii:]]{1,256}?)=("[[:ascii:]]{0,256}?")\s*,`)
++
++// DecodeLabels decodes a serialized label map as used in the OC_RESOURCE_LABELS variable.
++// A list of labels of the form `<key1>="<value1>",<key2>="<value2>",...` is accepted.
++// Domain names and paths are accepted as label keys.
++// Most users will want to use FromEnv instead.
++func DecodeLabels(s string) (map[string]string, error) {
++	m := map[string]string{}
++	// Ensure a trailing comma, which allows us to keep the regex simpler
++	s = strings.TrimRight(strings.TrimSpace(s), ",") + ","
++
++	for len(s) > 0 {
++		match := labelRegex.FindStringSubmatch(s)
++		if len(match) == 0 {
++			return nil, fmt.Errorf("invalid label formatting, remainder: %s", s)
++		}
++		v := match[2]
++		if v == "" {
++			v = match[3]
++		} else {
++			var err error
++			if v, err = strconv.Unquote(v); err != nil {
++				return nil, fmt.Errorf("invalid label formatting, remainder: %s, err: %s", s, err)
++			}
++		}
++		m[match[1]] = v
++
++		s = s[len(match[0]):]
++	}
++	return m, nil
++}
++
++// FromEnv is a detector that loads resource information from the OC_RESOURCE_TYPE
++// and OC_RESOURCE_labelS environment variables.
++func FromEnv(context.Context) (*Resource, error) {
++	res := &Resource{
++		Type: strings.TrimSpace(os.Getenv(EnvVarType)),
++	}
++	labels := strings.TrimSpace(os.Getenv(EnvVarLabels))
++	if labels == "" {
++		return res, nil
++	}
++	var err error
++	if res.Labels, err = DecodeLabels(labels); err != nil {
++		return nil, err
++	}
++	return res, nil
++}
++
++var _ Detector = FromEnv
++
++// merge resource information from b into a. In case of a collision, a takes precedence.
++func merge(a, b *Resource) *Resource {
++	if a == nil {
++		return b
++	}
++	if b == nil {
++		return a
++	}
++	res := &Resource{
++		Type:   a.Type,
++		Labels: map[string]string{},
++	}
++	if res.Type == "" {
++		res.Type = b.Type
++	}
++	for k, v := range b.Labels {
++		res.Labels[k] = v
++	}
++	// Labels from resource a overwrite labels from resource b.
++	for k, v := range a.Labels {
++		res.Labels[k] = v
++	}
++	return res
++}
++
++// Detector attempts to detect resource information.
++// If the detector cannot find resource information, the returned resource is nil but no
++// error is returned.
++// An error is only returned on unexpected failures.
++type Detector func(context.Context) (*Resource, error)
++
++// MultiDetector returns a Detector that calls all input detectors in order and
++// merges each result with the previous one. In case a type of label key is already set,
++// the first set value is takes precedence.
++// It returns on the first error that a sub-detector encounters.
++func MultiDetector(detectors ...Detector) Detector {
++	return func(ctx context.Context) (*Resource, error) {
++		return detectAll(ctx, detectors...)
++	}
++}
++
++// detectall calls all input detectors sequentially an merges each result with the previous one.
++// It returns on the first error that a sub-detector encounters.
++func detectAll(ctx context.Context, detectors ...Detector) (*Resource, error) {
++	var res *Resource
++	for _, d := range detectors {
++		r, err := d(ctx)
++		if err != nil {
++			return nil, err
++		}
++		res = merge(res, r)
++	}
++	return res, nil
++}
+diff --git a/vendor/go.opencensus.io/stats/doc.go b/vendor/go.opencensus.io/stats/doc.go
+new file mode 100644
+index 000000000..00d473ee0
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/doc.go
+@@ -0,0 +1,69 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++/*
++Package stats contains support for OpenCensus stats recording.
++
++OpenCensus allows users to create typed measures, record measurements,
++aggregate the collected data, and export the aggregated data.
++
++Measures
++
++A measure represents a type of data point to be tracked and recorded.
++For example, latency, request Mb/s, and response Mb/s are measures
++to collect from a server.
++
++Measure constructors such as Int64 and Float64 automatically
++register the measure by the given name. Each registered measure needs
++to be unique by name. Measures also have a description and a unit.
++
++Libraries can define and export measures. Application authors can then
++create views and collect and break down measures by the tags they are
++interested in.
++
++Recording measurements
++
++Measurement is a data point to be collected for a measure. For example,
++for a latency (ms) measure, 100 is a measurement that represents a 100ms
++latency event. Measurements are created from measures with
++the current context. Tags from the current context are recorded with the
++measurements if they are any.
++
++Recorded measurements are dropped immediately if no views are registered for them.
++There is usually no need to conditionally enable and disable
++recording to reduce cost. Recording of measurements is cheap.
++
++Libraries can always record measurements, and applications can later decide
++on which measurements they want to collect by registering views. This allows
++libraries to turn on the instrumentation by default.
++
++Exemplars
++
++For a given recorded measurement, the associated exemplar is a diagnostic map
++that gives more information about the measurement.
++
++When aggregated using a Distribution aggregation, an exemplar is kept for each
++bucket in the Distribution. This allows you to easily find an example of a
++measurement that fell into each bucket.
++
++For example, if you also use the OpenCensus trace package and you
++record a measurement with a context that contains a sampled trace span,
++then the trace span will be added to the exemplar associated with the measurement.
++
++When exported to a supporting back end, you should be able to easily navigate
++to example traces that fell into each bucket in the Distribution.
++
++*/
++package stats // import "go.opencensus.io/stats"
+diff --git a/vendor/go.opencensus.io/stats/internal/record.go b/vendor/go.opencensus.io/stats/internal/record.go
+new file mode 100644
+index 000000000..36935e629
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/internal/record.go
+@@ -0,0 +1,25 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package internal
++
++import (
++	"go.opencensus.io/tag"
++)
++
++// DefaultRecorder will be called for each Record call.
++var DefaultRecorder func(tags *tag.Map, measurement interface{}, attachments map[string]interface{})
++
++// SubscriptionReporter reports when a view subscribed with a measure.
++var SubscriptionReporter func(measure string)
+diff --git a/vendor/go.opencensus.io/stats/measure.go b/vendor/go.opencensus.io/stats/measure.go
+new file mode 100644
+index 000000000..1ffd3cefc
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/measure.go
+@@ -0,0 +1,109 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package stats
++
++import (
++	"sync"
++	"sync/atomic"
++)
++
++// Measure represents a single numeric value to be tracked and recorded.
++// For example, latency, request bytes, and response bytes could be measures
++// to collect from a server.
++//
++// Measures by themselves have no outside effects. In order to be exported,
++// the measure needs to be used in a View. If no Views are defined over a
++// measure, there is very little cost in recording it.
++type Measure interface {
++	// Name returns the name of this measure.
++	//
++	// Measure names are globally unique (among all libraries linked into your program).
++	// We recommend prefixing the measure name with a domain name relevant to your
++	// project or application.
++	//
++	// Measure names are never sent over the wire or exported to backends.
++	// They are only used to create Views.
++	Name() string
++
++	// Description returns the human-readable description of this measure.
++	Description() string
++
++	// Unit returns the units for the values this measure takes on.
++	//
++	// Units are encoded according to the case-sensitive abbreviations from the
++	// Unified Code for Units of Measure: http://unitsofmeasure.org/ucum.html
++	Unit() string
++}
++
++// measureDescriptor is the untyped descriptor associated with each measure.
++// Int64Measure and Float64Measure wrap measureDescriptor to provide typed
++// recording APIs.
++// Two Measures with the same name will have the same measureDescriptor.
++type measureDescriptor struct {
++	subs int32 // access atomically
++
++	name        string
++	description string
++	unit        string
++}
++
++func (m *measureDescriptor) subscribe() {
++	atomic.StoreInt32(&m.subs, 1)
++}
++
++func (m *measureDescriptor) subscribed() bool {
++	return atomic.LoadInt32(&m.subs) == 1
++}
++
++var (
++	mu       sync.RWMutex
++	measures = make(map[string]*measureDescriptor)
++)
++
++func registerMeasureHandle(name, desc, unit string) *measureDescriptor {
++	mu.Lock()
++	defer mu.Unlock()
++
++	if stored, ok := measures[name]; ok {
++		return stored
++	}
++	m := &measureDescriptor{
++		name:        name,
++		description: desc,
++		unit:        unit,
++	}
++	measures[name] = m
++	return m
++}
++
++// Measurement is the numeric value measured when recording stats. Each measure
++// provides methods to create measurements of their kind. For example, Int64Measure
++// provides M to convert an int64 into a measurement.
++type Measurement struct {
++	v    float64
++	m    Measure
++	desc *measureDescriptor
++}
++
++// Value returns the value of the Measurement as a float64.
++func (m Measurement) Value() float64 {
++	return m.v
++}
++
++// Measure returns the Measure from which this Measurement was created.
++func (m Measurement) Measure() Measure {
++	return m.m
++}
+diff --git a/vendor/go.opencensus.io/stats/measure_float64.go b/vendor/go.opencensus.io/stats/measure_float64.go
+new file mode 100644
+index 000000000..f02c1eda8
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/measure_float64.go
+@@ -0,0 +1,55 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package stats
++
++// Float64Measure is a measure for float64 values.
++type Float64Measure struct {
++	desc *measureDescriptor
++}
++
++// M creates a new float64 measurement.
++// Use Record to record measurements.
++func (m *Float64Measure) M(v float64) Measurement {
++	return Measurement{
++		m:    m,
++		desc: m.desc,
++		v:    v,
++	}
++}
++
++// Float64 creates a new measure for float64 values.
++//
++// See the documentation for interface Measure for more guidance on the
++// parameters of this function.
++func Float64(name, description, unit string) *Float64Measure {
++	mi := registerMeasureHandle(name, description, unit)
++	return &Float64Measure{mi}
++}
++
++// Name returns the name of the measure.
++func (m *Float64Measure) Name() string {
++	return m.desc.name
++}
++
++// Description returns the description of the measure.
++func (m *Float64Measure) Description() string {
++	return m.desc.description
++}
++
++// Unit returns the unit of the measure.
++func (m *Float64Measure) Unit() string {
++	return m.desc.unit
++}
+diff --git a/vendor/go.opencensus.io/stats/measure_int64.go b/vendor/go.opencensus.io/stats/measure_int64.go
+new file mode 100644
+index 000000000..d101d7973
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/measure_int64.go
+@@ -0,0 +1,55 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package stats
++
++// Int64Measure is a measure for int64 values.
++type Int64Measure struct {
++	desc *measureDescriptor
++}
++
++// M creates a new int64 measurement.
++// Use Record to record measurements.
++func (m *Int64Measure) M(v int64) Measurement {
++	return Measurement{
++		m:    m,
++		desc: m.desc,
++		v:    float64(v),
++	}
++}
++
++// Int64 creates a new measure for int64 values.
++//
++// See the documentation for interface Measure for more guidance on the
++// parameters of this function.
++func Int64(name, description, unit string) *Int64Measure {
++	mi := registerMeasureHandle(name, description, unit)
++	return &Int64Measure{mi}
++}
++
++// Name returns the name of the measure.
++func (m *Int64Measure) Name() string {
++	return m.desc.name
++}
++
++// Description returns the description of the measure.
++func (m *Int64Measure) Description() string {
++	return m.desc.description
++}
++
++// Unit returns the unit of the measure.
++func (m *Int64Measure) Unit() string {
++	return m.desc.unit
++}
+diff --git a/vendor/go.opencensus.io/stats/record.go b/vendor/go.opencensus.io/stats/record.go
+new file mode 100644
+index 000000000..2b9728346
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/record.go
+@@ -0,0 +1,137 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package stats
++
++import (
++	"context"
++
++	"go.opencensus.io/metric/metricdata"
++	"go.opencensus.io/stats/internal"
++	"go.opencensus.io/tag"
++)
++
++func init() {
++	internal.SubscriptionReporter = func(measure string) {
++		mu.Lock()
++		measures[measure].subscribe()
++		mu.Unlock()
++	}
++}
++
++// Recorder provides an interface for exporting measurement information from
++// the static Record method by using the WithRecorder option.
++type Recorder interface {
++	// Record records a set of measurements associated with the given tags and attachments.
++	// The second argument is a `[]Measurement`.
++	Record(*tag.Map, interface{}, map[string]interface{})
++}
++
++type recordOptions struct {
++	attachments  metricdata.Attachments
++	mutators     []tag.Mutator
++	measurements []Measurement
++	recorder     Recorder
++}
++
++// WithAttachments applies provided exemplar attachments.
++func WithAttachments(attachments metricdata.Attachments) Options {
++	return func(ro *recordOptions) {
++		ro.attachments = attachments
++	}
++}
++
++// WithTags applies provided tag mutators.
++func WithTags(mutators ...tag.Mutator) Options {
++	return func(ro *recordOptions) {
++		ro.mutators = mutators
++	}
++}
++
++// WithMeasurements applies provided measurements.
++func WithMeasurements(measurements ...Measurement) Options {
++	return func(ro *recordOptions) {
++		ro.measurements = measurements
++	}
++}
++
++// WithRecorder records the measurements to the specified `Recorder`, rather
++// than to the global metrics recorder.
++func WithRecorder(meter Recorder) Options {
++	return func(ro *recordOptions) {
++		ro.recorder = meter
++	}
++}
++
++// Options apply changes to recordOptions.
++type Options func(*recordOptions)
++
++func createRecordOption(ros ...Options) *recordOptions {
++	o := &recordOptions{}
++	for _, ro := range ros {
++		ro(o)
++	}
++	return o
++}
++
++// Record records one or multiple measurements with the same context at once.
++// If there are any tags in the context, measurements will be tagged with them.
++func Record(ctx context.Context, ms ...Measurement) {
++	RecordWithOptions(ctx, WithMeasurements(ms...))
++}
++
++// RecordWithTags records one or multiple measurements at once.
++//
++// Measurements will be tagged with the tags in the context mutated by the mutators.
++// RecordWithTags is useful if you want to record with tag mutations but don't want
++// to propagate the mutations in the context.
++func RecordWithTags(ctx context.Context, mutators []tag.Mutator, ms ...Measurement) error {
++	return RecordWithOptions(ctx, WithTags(mutators...), WithMeasurements(ms...))
++}
++
++// RecordWithOptions records measurements from the given options (if any) against context
++// and tags and attachments in the options (if any).
++// If there are any tags in the context, measurements will be tagged with them.
++func RecordWithOptions(ctx context.Context, ros ...Options) error {
++	o := createRecordOption(ros...)
++	if len(o.measurements) == 0 {
++		return nil
++	}
++	recorder := internal.DefaultRecorder
++	if o.recorder != nil {
++		recorder = o.recorder.Record
++	}
++	if recorder == nil {
++		return nil
++	}
++	record := false
++	for _, m := range o.measurements {
++		if m.desc.subscribed() {
++			record = true
++			break
++		}
++	}
++	if !record {
++		return nil
++	}
++	if len(o.mutators) > 0 {
++		var err error
++		if ctx, err = tag.New(ctx, o.mutators...); err != nil {
++			return err
++		}
++	}
++	recorder(tag.FromContext(ctx), o.measurements, o.attachments)
++	return nil
++}
+diff --git a/vendor/go.opencensus.io/stats/units.go b/vendor/go.opencensus.io/stats/units.go
+new file mode 100644
+index 000000000..736399652
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/units.go
+@@ -0,0 +1,26 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package stats
++
++// Units are encoded according to the case-sensitive abbreviations from the
++// Unified Code for Units of Measure: http://unitsofmeasure.org/ucum.html
++const (
++	UnitNone          = "1" // Deprecated: Use UnitDimensionless.
++	UnitDimensionless = "1"
++	UnitBytes         = "By"
++	UnitMilliseconds  = "ms"
++	UnitSeconds       = "s"
++)
+diff --git a/vendor/go.opencensus.io/stats/view/aggregation.go b/vendor/go.opencensus.io/stats/view/aggregation.go
+new file mode 100644
+index 000000000..748bd568c
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/view/aggregation.go
+@@ -0,0 +1,123 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package view
++
++import "time"
++
++// AggType represents the type of aggregation function used on a View.
++type AggType int
++
++// All available aggregation types.
++const (
++	AggTypeNone         AggType = iota // no aggregation; reserved for future use.
++	AggTypeCount                       // the count aggregation, see Count.
++	AggTypeSum                         // the sum aggregation, see Sum.
++	AggTypeDistribution                // the distribution aggregation, see Distribution.
++	AggTypeLastValue                   // the last value aggregation, see LastValue.
++)
++
++func (t AggType) String() string {
++	return aggTypeName[t]
++}
++
++var aggTypeName = map[AggType]string{
++	AggTypeNone:         "None",
++	AggTypeCount:        "Count",
++	AggTypeSum:          "Sum",
++	AggTypeDistribution: "Distribution",
++	AggTypeLastValue:    "LastValue",
++}
++
++// Aggregation represents a data aggregation method. Use one of the functions:
++// Count, Sum, or Distribution to construct an Aggregation.
++type Aggregation struct {
++	Type    AggType   // Type is the AggType of this Aggregation.
++	Buckets []float64 // Buckets are the bucket endpoints if this Aggregation represents a distribution, see Distribution.
++
++	newData func(time.Time) AggregationData
++}
++
++var (
++	aggCount = &Aggregation{
++		Type: AggTypeCount,
++		newData: func(t time.Time) AggregationData {
++			return &CountData{Start: t}
++		},
++	}
++	aggSum = &Aggregation{
++		Type: AggTypeSum,
++		newData: func(t time.Time) AggregationData {
++			return &SumData{Start: t}
++		},
++	}
++)
++
++// Count indicates that data collected and aggregated
++// with this method will be turned into a count value.
++// For example, total number of accepted requests can be
++// aggregated by using Count.
++func Count() *Aggregation {
++	return aggCount
++}
++
++// Sum indicates that data collected and aggregated
++// with this method will be summed up.
++// For example, accumulated request bytes can be aggregated by using
++// Sum.
++func Sum() *Aggregation {
++	return aggSum
++}
++
++// Distribution indicates that the desired aggregation is
++// a histogram distribution.
++//
++// A distribution aggregation may contain a histogram of the values in the
++// population. The bucket boundaries for that histogram are described
++// by the bounds. This defines len(bounds)+1 buckets.
++//
++// If len(bounds) >= 2 then the boundaries for bucket index i are:
++//
++//     [-infinity, bounds[i]) for i = 0
++//     [bounds[i-1], bounds[i]) for 0 < i < length
++//     [bounds[i-1], +infinity) for i = length
++//
++// If len(bounds) is 0 then there is no histogram associated with the
++// distribution. There will be a single bucket with boundaries
++// (-infinity, +infinity).
++//
++// If len(bounds) is 1 then there is no finite buckets, and that single
++// element is the common boundary of the overflow and underflow buckets.
++func Distribution(bounds ...float64) *Aggregation {
++	agg := &Aggregation{
++		Type:    AggTypeDistribution,
++		Buckets: bounds,
++	}
++	agg.newData = func(t time.Time) AggregationData {
++		return newDistributionData(agg, t)
++	}
++	return agg
++}
++
++// LastValue only reports the last value recorded using this
++// aggregation. All other measurements will be dropped.
++func LastValue() *Aggregation {
++	return &Aggregation{
++		Type: AggTypeLastValue,
++		newData: func(_ time.Time) AggregationData {
++			return &LastValueData{}
++		},
++	}
++}
+diff --git a/vendor/go.opencensus.io/stats/view/aggregation_data.go b/vendor/go.opencensus.io/stats/view/aggregation_data.go
+new file mode 100644
+index 000000000..d93b52066
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/view/aggregation_data.go
+@@ -0,0 +1,336 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package view
++
++import (
++	"math"
++	"time"
++
++	"go.opencensus.io/metric/metricdata"
++)
++
++// AggregationData represents an aggregated value from a collection.
++// They are reported on the view data during exporting.
++// Mosts users won't directly access aggregration data.
++type AggregationData interface {
++	isAggregationData() bool
++	addSample(v float64, attachments map[string]interface{}, t time.Time)
++	clone() AggregationData
++	equal(other AggregationData) bool
++	toPoint(t metricdata.Type, time time.Time) metricdata.Point
++	StartTime() time.Time
++}
++
++const epsilon = 1e-9
++
++// CountData is the aggregated data for the Count aggregation.
++// A count aggregation processes data and counts the recordings.
++//
++// Most users won't directly access count data.
++type CountData struct {
++	Start time.Time
++	Value int64
++}
++
++func (a *CountData) isAggregationData() bool { return true }
++
++func (a *CountData) addSample(_ float64, _ map[string]interface{}, _ time.Time) {
++	a.Value = a.Value + 1
++}
++
++func (a *CountData) clone() AggregationData {
++	return &CountData{Value: a.Value, Start: a.Start}
++}
++
++func (a *CountData) equal(other AggregationData) bool {
++	a2, ok := other.(*CountData)
++	if !ok {
++		return false
++	}
++
++	return a.Start.Equal(a2.Start) && a.Value == a2.Value
++}
++
++func (a *CountData) toPoint(metricType metricdata.Type, t time.Time) metricdata.Point {
++	switch metricType {
++	case metricdata.TypeCumulativeInt64:
++		return metricdata.NewInt64Point(t, a.Value)
++	default:
++		panic("unsupported metricdata.Type")
++	}
++}
++
++// StartTime returns the start time of the data being aggregated by CountData.
++func (a *CountData) StartTime() time.Time {
++	return a.Start
++}
++
++// SumData is the aggregated data for the Sum aggregation.
++// A sum aggregation processes data and sums up the recordings.
++//
++// Most users won't directly access sum data.
++type SumData struct {
++	Start time.Time
++	Value float64
++}
++
++func (a *SumData) isAggregationData() bool { return true }
++
++func (a *SumData) addSample(v float64, _ map[string]interface{}, _ time.Time) {
++	a.Value += v
++}
++
++func (a *SumData) clone() AggregationData {
++	return &SumData{Value: a.Value, Start: a.Start}
++}
++
++func (a *SumData) equal(other AggregationData) bool {
++	a2, ok := other.(*SumData)
++	if !ok {
++		return false
++	}
++	return a.Start.Equal(a2.Start) && math.Pow(a.Value-a2.Value, 2) < epsilon
++}
++
++func (a *SumData) toPoint(metricType metricdata.Type, t time.Time) metricdata.Point {
++	switch metricType {
++	case metricdata.TypeCumulativeInt64:
++		return metricdata.NewInt64Point(t, int64(a.Value))
++	case metricdata.TypeCumulativeFloat64:
++		return metricdata.NewFloat64Point(t, a.Value)
++	default:
++		panic("unsupported metricdata.Type")
++	}
++}
++
++// StartTime returns the start time of the data being aggregated by SumData.
++func (a *SumData) StartTime() time.Time {
++	return a.Start
++}
++
++// DistributionData is the aggregated data for the
++// Distribution aggregation.
++//
++// Most users won't directly access distribution data.
++//
++// For a distribution with N bounds, the associated DistributionData will have
++// N+1 buckets.
++type DistributionData struct {
++	Count           int64   // number of data points aggregated
++	Min             float64 // minimum value in the distribution
++	Max             float64 // max value in the distribution
++	Mean            float64 // mean of the distribution
++	SumOfSquaredDev float64 // sum of the squared deviation from the mean
++	CountPerBucket  []int64 // number of occurrences per bucket
++	// ExemplarsPerBucket is slice the same length as CountPerBucket containing
++	// an exemplar for the associated bucket, or nil.
++	ExemplarsPerBucket []*metricdata.Exemplar
++	bounds             []float64 // histogram distribution of the values
++	Start              time.Time
++}
++
++func newDistributionData(agg *Aggregation, t time.Time) *DistributionData {
++	bucketCount := len(agg.Buckets) + 1
++	return &DistributionData{
++		CountPerBucket:     make([]int64, bucketCount),
++		ExemplarsPerBucket: make([]*metricdata.Exemplar, bucketCount),
++		bounds:             agg.Buckets,
++		Min:                math.MaxFloat64,
++		Max:                math.SmallestNonzeroFloat64,
++		Start:              t,
++	}
++}
++
++// Sum returns the sum of all samples collected.
++func (a *DistributionData) Sum() float64 { return a.Mean * float64(a.Count) }
++
++func (a *DistributionData) variance() float64 {
++	if a.Count <= 1 {
++		return 0
++	}
++	return a.SumOfSquaredDev / float64(a.Count-1)
++}
++
++func (a *DistributionData) isAggregationData() bool { return true }
++
++// TODO(songy23): support exemplar attachments.
++func (a *DistributionData) addSample(v float64, attachments map[string]interface{}, t time.Time) {
++	if v < a.Min {
++		a.Min = v
++	}
++	if v > a.Max {
++		a.Max = v
++	}
++	a.Count++
++	a.addToBucket(v, attachments, t)
++
++	if a.Count == 1 {
++		a.Mean = v
++		return
++	}
++
++	oldMean := a.Mean
++	a.Mean = a.Mean + (v-a.Mean)/float64(a.Count)
++	a.SumOfSquaredDev = a.SumOfSquaredDev + (v-oldMean)*(v-a.Mean)
++}
++
++func (a *DistributionData) addToBucket(v float64, attachments map[string]interface{}, t time.Time) {
++	var count *int64
++	var i int
++	var b float64
++	for i, b = range a.bounds {
++		if v < b {
++			count = &a.CountPerBucket[i]
++			break
++		}
++	}
++	if count == nil { // Last bucket.
++		i = len(a.bounds)
++		count = &a.CountPerBucket[i]
++	}
++	*count++
++	if exemplar := getExemplar(v, attachments, t); exemplar != nil {
++		a.ExemplarsPerBucket[i] = exemplar
++	}
++}
++
++func getExemplar(v float64, attachments map[string]interface{}, t time.Time) *metricdata.Exemplar {
++	if len(attachments) == 0 {
++		return nil
++	}
++	return &metricdata.Exemplar{
++		Value:       v,
++		Timestamp:   t,
++		Attachments: attachments,
++	}
++}
++
++func (a *DistributionData) clone() AggregationData {
++	c := *a
++	c.CountPerBucket = append([]int64(nil), a.CountPerBucket...)
++	c.ExemplarsPerBucket = append([]*metricdata.Exemplar(nil), a.ExemplarsPerBucket...)
++	return &c
++}
++
++func (a *DistributionData) equal(other AggregationData) bool {
++	a2, ok := other.(*DistributionData)
++	if !ok {
++		return false
++	}
++	if a2 == nil {
++		return false
++	}
++	if len(a.CountPerBucket) != len(a2.CountPerBucket) {
++		return false
++	}
++	for i := range a.CountPerBucket {
++		if a.CountPerBucket[i] != a2.CountPerBucket[i] {
++			return false
++		}
++	}
++	return a.Start.Equal(a2.Start) &&
++		a.Count == a2.Count &&
++		a.Min == a2.Min &&
++		a.Max == a2.Max &&
++		math.Pow(a.Mean-a2.Mean, 2) < epsilon && math.Pow(a.variance()-a2.variance(), 2) < epsilon
++}
++
++func (a *DistributionData) toPoint(metricType metricdata.Type, t time.Time) metricdata.Point {
++	switch metricType {
++	case metricdata.TypeCumulativeDistribution:
++		buckets := []metricdata.Bucket{}
++		for i := 0; i < len(a.CountPerBucket); i++ {
++			buckets = append(buckets, metricdata.Bucket{
++				Count:    a.CountPerBucket[i],
++				Exemplar: a.ExemplarsPerBucket[i],
++			})
++		}
++		bucketOptions := &metricdata.BucketOptions{Bounds: a.bounds}
++
++		val := &metricdata.Distribution{
++			Count:                 a.Count,
++			Sum:                   a.Sum(),
++			SumOfSquaredDeviation: a.SumOfSquaredDev,
++			BucketOptions:         bucketOptions,
++			Buckets:               buckets,
++		}
++		return metricdata.NewDistributionPoint(t, val)
++
++	default:
++		// TODO: [rghetia] when we have a use case for TypeGaugeDistribution.
++		panic("unsupported metricdata.Type")
++	}
++}
++
++// StartTime returns the start time of the data being aggregated by DistributionData.
++func (a *DistributionData) StartTime() time.Time {
++	return a.Start
++}
++
++// LastValueData returns the last value recorded for LastValue aggregation.
++type LastValueData struct {
++	Value float64
++}
++
++func (l *LastValueData) isAggregationData() bool {
++	return true
++}
++
++func (l *LastValueData) addSample(v float64, _ map[string]interface{}, _ time.Time) {
++	l.Value = v
++}
++
++func (l *LastValueData) clone() AggregationData {
++	return &LastValueData{l.Value}
++}
++
++func (l *LastValueData) equal(other AggregationData) bool {
++	a2, ok := other.(*LastValueData)
++	if !ok {
++		return false
++	}
++	return l.Value == a2.Value
++}
++
++func (l *LastValueData) toPoint(metricType metricdata.Type, t time.Time) metricdata.Point {
++	switch metricType {
++	case metricdata.TypeGaugeInt64:
++		return metricdata.NewInt64Point(t, int64(l.Value))
++	case metricdata.TypeGaugeFloat64:
++		return metricdata.NewFloat64Point(t, l.Value)
++	default:
++		panic("unsupported metricdata.Type")
++	}
++}
++
++// StartTime returns an empty time value as start time is not recorded when using last value
++// aggregation.
++func (l *LastValueData) StartTime() time.Time {
++	return time.Time{}
++}
++
++// ClearStart clears the Start field from data if present. Useful for testing in cases where the
++// start time will be nondeterministic.
++func ClearStart(data AggregationData) {
++	switch data := data.(type) {
++	case *CountData:
++		data.Start = time.Time{}
++	case *SumData:
++		data.Start = time.Time{}
++	case *DistributionData:
++		data.Start = time.Time{}
++	}
++}
+diff --git a/vendor/go.opencensus.io/stats/view/collector.go b/vendor/go.opencensus.io/stats/view/collector.go
+new file mode 100644
+index 000000000..ac22c93a2
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/view/collector.go
+@@ -0,0 +1,86 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package view
++
++import (
++	"sort"
++	"time"
++
++	"go.opencensus.io/internal/tagencoding"
++	"go.opencensus.io/tag"
++)
++
++type collector struct {
++	// signatures holds the aggregations values for each unique tag signature
++	// (values for all keys) to its aggregator.
++	signatures map[string]AggregationData
++	// Aggregation is the description of the aggregation to perform for this
++	// view.
++	a *Aggregation
++}
++
++func (c *collector) addSample(s string, v float64, attachments map[string]interface{}, t time.Time) {
++	aggregator, ok := c.signatures[s]
++	if !ok {
++		aggregator = c.a.newData(t)
++		c.signatures[s] = aggregator
++	}
++	aggregator.addSample(v, attachments, t)
++}
++
++// collectRows returns a snapshot of the collected Row values.
++func (c *collector) collectedRows(keys []tag.Key) []*Row {
++	rows := make([]*Row, 0, len(c.signatures))
++	for sig, aggregator := range c.signatures {
++		tags := decodeTags([]byte(sig), keys)
++		row := &Row{Tags: tags, Data: aggregator.clone()}
++		rows = append(rows, row)
++	}
++	return rows
++}
++
++func (c *collector) clearRows() {
++	c.signatures = make(map[string]AggregationData)
++}
++
++// encodeWithKeys encodes the map by using values
++// only associated with the keys provided.
++func encodeWithKeys(m *tag.Map, keys []tag.Key) []byte {
++	vb := &tagencoding.Values{
++		Buffer: make([]byte, len(keys)),
++	}
++	for _, k := range keys {
++		v, _ := m.Value(k)
++		vb.WriteValue([]byte(v))
++	}
++	return vb.Bytes()
++}
++
++// decodeTags decodes tags from the buffer and
++// orders them by the keys.
++func decodeTags(buf []byte, keys []tag.Key) []tag.Tag {
++	vb := &tagencoding.Values{Buffer: buf}
++	var tags []tag.Tag
++	for _, k := range keys {
++		v := vb.ReadValue()
++		if v != nil {
++			tags = append(tags, tag.Tag{Key: k, Value: string(v)})
++		}
++	}
++	vb.ReadIndex = 0
++	sort.Slice(tags, func(i, j int) bool { return tags[i].Key.Name() < tags[j].Key.Name() })
++	return tags
++}
+diff --git a/vendor/go.opencensus.io/stats/view/doc.go b/vendor/go.opencensus.io/stats/view/doc.go
+new file mode 100644
+index 000000000..7bbedfe1f
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/view/doc.go
+@@ -0,0 +1,47 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++// Package view contains support for collecting and exposing aggregates over stats.
++//
++// In order to collect measurements, views need to be defined and registered.
++// A view allows recorded measurements to be filtered and aggregated.
++//
++// All recorded measurements can be grouped by a list of tags.
++//
++// OpenCensus provides several aggregation methods: Count, Distribution and Sum.
++//
++// Count only counts the number of measurement points recorded.
++// Distribution provides statistical summary of the aggregated data by counting
++// how many recorded measurements fall into each bucket.
++// Sum adds up the measurement values.
++// LastValue just keeps track of the most recently recorded measurement value.
++// All aggregations are cumulative.
++//
++// Views can be registered and unregistered at any time during program execution.
++//
++// Libraries can define views but it is recommended that in most cases registering
++// views be left up to applications.
++//
++// Exporting
++//
++// Collected and aggregated data can be exported to a metric collection
++// backend by registering its exporter.
++//
++// Multiple exporters can be registered to upload the data to various
++// different back ends.
++package view // import "go.opencensus.io/stats/view"
++
++// TODO(acetechnologist): Add a link to the language independent OpenCensus
++// spec when it is available.
+diff --git a/vendor/go.opencensus.io/stats/view/export.go b/vendor/go.opencensus.io/stats/view/export.go
+new file mode 100644
+index 000000000..73ba11f5b
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/view/export.go
+@@ -0,0 +1,45 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package view
++
++// Exporter exports the collected records as view data.
++//
++// The ExportView method should return quickly; if an
++// Exporter takes a significant amount of time to
++// process a Data, that work should be done on another goroutine.
++//
++// It is safe to assume that ExportView will not be called concurrently from
++// multiple goroutines.
++//
++// The Data should not be modified.
++type Exporter interface {
++	ExportView(viewData *Data)
++}
++
++// RegisterExporter registers an exporter.
++// Collected data will be reported via all the
++// registered exporters. Once you no longer
++// want data to be exported, invoke UnregisterExporter
++// with the previously registered exporter.
++//
++// Binaries can register exporters, libraries shouldn't register exporters.
++func RegisterExporter(e Exporter) {
++	defaultWorker.RegisterExporter(e)
++}
++
++// UnregisterExporter unregisters an exporter.
++func UnregisterExporter(e Exporter) {
++	defaultWorker.UnregisterExporter(e)
++}
+diff --git a/vendor/go.opencensus.io/stats/view/view.go b/vendor/go.opencensus.io/stats/view/view.go
+new file mode 100644
+index 000000000..293b54ecb
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/view/view.go
+@@ -0,0 +1,221 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package view
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"reflect"
++	"sort"
++	"sync/atomic"
++	"time"
++
++	"go.opencensus.io/metric/metricdata"
++	"go.opencensus.io/stats"
++	"go.opencensus.io/tag"
++)
++
++// View allows users to aggregate the recorded stats.Measurements.
++// Views need to be passed to the Register function before data will be
++// collected and sent to Exporters.
++type View struct {
++	Name        string // Name of View. Must be unique. If unset, will default to the name of the Measure.
++	Description string // Description is a human-readable description for this view.
++
++	// TagKeys are the tag keys describing the grouping of this view.
++	// A single Row will be produced for each combination of associated tag values.
++	TagKeys []tag.Key
++
++	// Measure is a stats.Measure to aggregate in this view.
++	Measure stats.Measure
++
++	// Aggregation is the aggregation function to apply to the set of Measurements.
++	Aggregation *Aggregation
++}
++
++// WithName returns a copy of the View with a new name. This is useful for
++// renaming views to cope with limitations placed on metric names by various
++// backends.
++func (v *View) WithName(name string) *View {
++	vNew := *v
++	vNew.Name = name
++	return &vNew
++}
++
++// same compares two views and returns true if they represent the same aggregation.
++func (v *View) same(other *View) bool {
++	if v == other {
++		return true
++	}
++	if v == nil {
++		return false
++	}
++	return reflect.DeepEqual(v.Aggregation, other.Aggregation) &&
++		v.Measure.Name() == other.Measure.Name()
++}
++
++// ErrNegativeBucketBounds error returned if histogram contains negative bounds.
++//
++// Deprecated: this should not be public.
++var ErrNegativeBucketBounds = errors.New("negative bucket bounds not supported")
++
++// canonicalize canonicalizes v by setting explicit
++// defaults for Name and Description and sorting the TagKeys
++func (v *View) canonicalize() error {
++	if v.Measure == nil {
++		return fmt.Errorf("cannot register view %q: measure not set", v.Name)
++	}
++	if v.Aggregation == nil {
++		return fmt.Errorf("cannot register view %q: aggregation not set", v.Name)
++	}
++	if v.Name == "" {
++		v.Name = v.Measure.Name()
++	}
++	if v.Description == "" {
++		v.Description = v.Measure.Description()
++	}
++	if err := checkViewName(v.Name); err != nil {
++		return err
++	}
++	sort.Slice(v.TagKeys, func(i, j int) bool {
++		return v.TagKeys[i].Name() < v.TagKeys[j].Name()
++	})
++	sort.Float64s(v.Aggregation.Buckets)
++	for _, b := range v.Aggregation.Buckets {
++		if b < 0 {
++			return ErrNegativeBucketBounds
++		}
++	}
++	// drop 0 bucket silently.
++	v.Aggregation.Buckets = dropZeroBounds(v.Aggregation.Buckets...)
++
++	return nil
++}
++
++func dropZeroBounds(bounds ...float64) []float64 {
++	for i, bound := range bounds {
++		if bound > 0 {
++			return bounds[i:]
++		}
++	}
++	return []float64{}
++}
++
++// viewInternal is the internal representation of a View.
++type viewInternal struct {
++	view             *View  // view is the canonicalized View definition associated with this view.
++	subscribed       uint32 // 1 if someone is subscribed and data need to be exported, use atomic to access
++	collector        *collector
++	metricDescriptor *metricdata.Descriptor
++}
++
++func newViewInternal(v *View) (*viewInternal, error) {
++	return &viewInternal{
++		view:             v,
++		collector:        &collector{make(map[string]AggregationData), v.Aggregation},
++		metricDescriptor: viewToMetricDescriptor(v),
++	}, nil
++}
++
++func (v *viewInternal) subscribe() {
++	atomic.StoreUint32(&v.subscribed, 1)
++}
++
++func (v *viewInternal) unsubscribe() {
++	atomic.StoreUint32(&v.subscribed, 0)
++}
++
++// isSubscribed returns true if the view is exporting
++// data by subscription.
++func (v *viewInternal) isSubscribed() bool {
++	return atomic.LoadUint32(&v.subscribed) == 1
++}
++
++func (v *viewInternal) clearRows() {
++	v.collector.clearRows()
++}
++
++func (v *viewInternal) collectedRows() []*Row {
++	return v.collector.collectedRows(v.view.TagKeys)
++}
++
++func (v *viewInternal) addSample(m *tag.Map, val float64, attachments map[string]interface{}, t time.Time) {
++	if !v.isSubscribed() {
++		return
++	}
++	sig := string(encodeWithKeys(m, v.view.TagKeys))
++	v.collector.addSample(sig, val, attachments, t)
++}
++
++// A Data is a set of rows about usage of the single measure associated
++// with the given view. Each row is specific to a unique set of tags.
++type Data struct {
++	View       *View
++	Start, End time.Time
++	Rows       []*Row
++}
++
++// Row is the collected value for a specific set of key value pairs a.k.a tags.
++type Row struct {
++	Tags []tag.Tag
++	Data AggregationData
++}
++
++func (r *Row) String() string {
++	var buffer bytes.Buffer
++	buffer.WriteString("{ ")
++	buffer.WriteString("{ ")
++	for _, t := range r.Tags {
++		buffer.WriteString(fmt.Sprintf("{%v %v}", t.Key.Name(), t.Value))
++	}
++	buffer.WriteString(" }")
++	buffer.WriteString(fmt.Sprintf("%v", r.Data))
++	buffer.WriteString(" }")
++	return buffer.String()
++}
++
++// Equal returns true if both rows are equal. Tags are expected to be ordered
++// by the key name. Even if both rows have the same tags but the tags appear in
++// different orders it will return false.
++func (r *Row) Equal(other *Row) bool {
++	if r == other {
++		return true
++	}
++	return reflect.DeepEqual(r.Tags, other.Tags) && r.Data.equal(other.Data)
++}
++
++const maxNameLength = 255
++
++// Returns true if the given string contains only printable characters.
++func isPrintable(str string) bool {
++	for _, r := range str {
++		if !(r >= ' ' && r <= '~') {
++			return false
++		}
++	}
++	return true
++}
++
++func checkViewName(name string) error {
++	if len(name) > maxNameLength {
++		return fmt.Errorf("view name cannot be larger than %v", maxNameLength)
++	}
++	if !isPrintable(name) {
++		return fmt.Errorf("view name needs to be an ASCII string")
++	}
++	return nil
++}
+diff --git a/vendor/go.opencensus.io/stats/view/view_to_metric.go b/vendor/go.opencensus.io/stats/view/view_to_metric.go
+new file mode 100644
+index 000000000..57d615ec7
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/view/view_to_metric.go
+@@ -0,0 +1,147 @@
++// Copyright 2019, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package view
++
++import (
++	"time"
++
++	"go.opencensus.io/resource"
++
++	"go.opencensus.io/metric/metricdata"
++	"go.opencensus.io/stats"
++)
++
++func getUnit(unit string) metricdata.Unit {
++	switch unit {
++	case "1":
++		return metricdata.UnitDimensionless
++	case "ms":
++		return metricdata.UnitMilliseconds
++	case "By":
++		return metricdata.UnitBytes
++	}
++	return metricdata.UnitDimensionless
++}
++
++func getType(v *View) metricdata.Type {
++	m := v.Measure
++	agg := v.Aggregation
++
++	switch agg.Type {
++	case AggTypeSum:
++		switch m.(type) {
++		case *stats.Int64Measure:
++			return metricdata.TypeCumulativeInt64
++		case *stats.Float64Measure:
++			return metricdata.TypeCumulativeFloat64
++		default:
++			panic("unexpected measure type")
++		}
++	case AggTypeDistribution:
++		return metricdata.TypeCumulativeDistribution
++	case AggTypeLastValue:
++		switch m.(type) {
++		case *stats.Int64Measure:
++			return metricdata.TypeGaugeInt64
++		case *stats.Float64Measure:
++			return metricdata.TypeGaugeFloat64
++		default:
++			panic("unexpected measure type")
++		}
++	case AggTypeCount:
++		switch m.(type) {
++		case *stats.Int64Measure:
++			return metricdata.TypeCumulativeInt64
++		case *stats.Float64Measure:
++			return metricdata.TypeCumulativeInt64
++		default:
++			panic("unexpected measure type")
++		}
++	default:
++		panic("unexpected aggregation type")
++	}
++}
++
++func getLabelKeys(v *View) []metricdata.LabelKey {
++	labelKeys := []metricdata.LabelKey{}
++	for _, k := range v.TagKeys {
++		labelKeys = append(labelKeys, metricdata.LabelKey{Key: k.Name()})
++	}
++	return labelKeys
++}
++
++func viewToMetricDescriptor(v *View) *metricdata.Descriptor {
++	return &metricdata.Descriptor{
++		Name:        v.Name,
++		Description: v.Description,
++		Unit:        convertUnit(v),
++		Type:        getType(v),
++		LabelKeys:   getLabelKeys(v),
++	}
++}
++
++func convertUnit(v *View) metricdata.Unit {
++	switch v.Aggregation.Type {
++	case AggTypeCount:
++		return metricdata.UnitDimensionless
++	default:
++		return getUnit(v.Measure.Unit())
++	}
++}
++
++func toLabelValues(row *Row, expectedKeys []metricdata.LabelKey) []metricdata.LabelValue {
++	labelValues := []metricdata.LabelValue{}
++	tagMap := make(map[string]string)
++	for _, tag := range row.Tags {
++		tagMap[tag.Key.Name()] = tag.Value
++	}
++
++	for _, key := range expectedKeys {
++		if val, ok := tagMap[key.Key]; ok {
++			labelValues = append(labelValues, metricdata.NewLabelValue(val))
++		} else {
++			labelValues = append(labelValues, metricdata.LabelValue{})
++		}
++	}
++	return labelValues
++}
++
++func rowToTimeseries(v *viewInternal, row *Row, now time.Time) *metricdata.TimeSeries {
++	return &metricdata.TimeSeries{
++		Points:      []metricdata.Point{row.Data.toPoint(v.metricDescriptor.Type, now)},
++		LabelValues: toLabelValues(row, v.metricDescriptor.LabelKeys),
++		StartTime:   row.Data.StartTime(),
++	}
++}
++
++func viewToMetric(v *viewInternal, r *resource.Resource, now time.Time) *metricdata.Metric {
++	rows := v.collectedRows()
++	if len(rows) == 0 {
++		return nil
++	}
++
++	ts := []*metricdata.TimeSeries{}
++	for _, row := range rows {
++		ts = append(ts, rowToTimeseries(v, row, now))
++	}
++
++	m := &metricdata.Metric{
++		Descriptor: *v.metricDescriptor,
++		TimeSeries: ts,
++		Resource:   r,
++	}
++	return m
++}
+diff --git a/vendor/go.opencensus.io/stats/view/worker.go b/vendor/go.opencensus.io/stats/view/worker.go
+new file mode 100644
+index 000000000..6e8d18b7f
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/view/worker.go
+@@ -0,0 +1,405 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package view
++
++import (
++	"fmt"
++	"sync"
++	"time"
++
++	"go.opencensus.io/resource"
++
++	"go.opencensus.io/metric/metricdata"
++	"go.opencensus.io/metric/metricproducer"
++	"go.opencensus.io/stats"
++	"go.opencensus.io/stats/internal"
++	"go.opencensus.io/tag"
++)
++
++func init() {
++	defaultWorker = NewMeter().(*worker)
++	go defaultWorker.start()
++	internal.DefaultRecorder = record
++}
++
++type measureRef struct {
++	measure string
++	views   map[*viewInternal]struct{}
++}
++
++type worker struct {
++	measures       map[string]*measureRef
++	views          map[string]*viewInternal
++	viewStartTimes map[*viewInternal]time.Time
++
++	timer      *time.Ticker
++	c          chan command
++	quit, done chan bool
++	mu         sync.RWMutex
++	r          *resource.Resource
++
++	exportersMu sync.RWMutex
++	exporters   map[Exporter]struct{}
++}
++
++// Meter defines an interface which allows a single process to maintain
++// multiple sets of metrics exports (intended for the advanced case where a
++// single process wants to report metrics about multiple objects, such as
++// multiple databases or HTTP services).
++//
++// Note that this is an advanced use case, and the static functions in this
++// module should cover the common use cases.
++type Meter interface {
++	stats.Recorder
++	// Find returns a registered view associated with this name.
++	// If no registered view is found, nil is returned.
++	Find(name string) *View
++	// Register begins collecting data for the given views.
++	// Once a view is registered, it reports data to the registered exporters.
++	Register(views ...*View) error
++	// Unregister the given views. Data will not longer be exported for these views
++	// after Unregister returns.
++	// It is not necessary to unregister from views you expect to collect for the
++	// duration of your program execution.
++	Unregister(views ...*View)
++	// SetReportingPeriod sets the interval between reporting aggregated views in
++	// the program. If duration is less than or equal to zero, it enables the
++	// default behavior.
++	//
++	// Note: each exporter makes different promises about what the lowest supported
++	// duration is. For example, the Stackdriver exporter recommends a value no
++	// lower than 1 minute. Consult each exporter per your needs.
++	SetReportingPeriod(time.Duration)
++
++	// RegisterExporter registers an exporter.
++	// Collected data will be reported via all the
++	// registered exporters. Once you no longer
++	// want data to be exported, invoke UnregisterExporter
++	// with the previously registered exporter.
++	//
++	// Binaries can register exporters, libraries shouldn't register exporters.
++	RegisterExporter(Exporter)
++	// UnregisterExporter unregisters an exporter.
++	UnregisterExporter(Exporter)
++	// SetResource may be used to set the Resource associated with this registry.
++	// This is intended to be used in cases where a single process exports metrics
++	// for multiple Resources, typically in a multi-tenant situation.
++	SetResource(*resource.Resource)
++
++	// Start causes the Meter to start processing Record calls and aggregating
++	// statistics as well as exporting data.
++	Start()
++	// Stop causes the Meter to stop processing calls and terminate data export.
++	Stop()
++
++	// RetrieveData gets a snapshot of the data collected for the the view registered
++	// with the given name. It is intended for testing only.
++	RetrieveData(viewName string) ([]*Row, error)
++}
++
++var _ Meter = (*worker)(nil)
++
++var defaultWorker *worker
++
++var defaultReportingDuration = 10 * time.Second
++
++// Find returns a registered view associated with this name.
++// If no registered view is found, nil is returned.
++func Find(name string) (v *View) {
++	return defaultWorker.Find(name)
++}
++
++// Find returns a registered view associated with this name.
++// If no registered view is found, nil is returned.
++func (w *worker) Find(name string) (v *View) {
++	req := &getViewByNameReq{
++		name: name,
++		c:    make(chan *getViewByNameResp),
++	}
++	w.c <- req
++	resp := <-req.c
++	return resp.v
++}
++
++// Register begins collecting data for the given views.
++// Once a view is registered, it reports data to the registered exporters.
++func Register(views ...*View) error {
++	return defaultWorker.Register(views...)
++}
++
++// Register begins collecting data for the given views.
++// Once a view is registered, it reports data to the registered exporters.
++func (w *worker) Register(views ...*View) error {
++	req := &registerViewReq{
++		views: views,
++		err:   make(chan error),
++	}
++	w.c <- req
++	return <-req.err
++}
++
++// Unregister the given views. Data will not longer be exported for these views
++// after Unregister returns.
++// It is not necessary to unregister from views you expect to collect for the
++// duration of your program execution.
++func Unregister(views ...*View) {
++	defaultWorker.Unregister(views...)
++}
++
++// Unregister the given views. Data will not longer be exported for these views
++// after Unregister returns.
++// It is not necessary to unregister from views you expect to collect for the
++// duration of your program execution.
++func (w *worker) Unregister(views ...*View) {
++	names := make([]string, len(views))
++	for i := range views {
++		names[i] = views[i].Name
++	}
++	req := &unregisterFromViewReq{
++		views: names,
++		done:  make(chan struct{}),
++	}
++	w.c <- req
++	<-req.done
++}
++
++// RetrieveData gets a snapshot of the data collected for the the view registered
++// with the given name. It is intended for testing only.
++func RetrieveData(viewName string) ([]*Row, error) {
++	return defaultWorker.RetrieveData(viewName)
++}
++
++// RetrieveData gets a snapshot of the data collected for the the view registered
++// with the given name. It is intended for testing only.
++func (w *worker) RetrieveData(viewName string) ([]*Row, error) {
++	req := &retrieveDataReq{
++		now: time.Now(),
++		v:   viewName,
++		c:   make(chan *retrieveDataResp),
++	}
++	w.c <- req
++	resp := <-req.c
++	return resp.rows, resp.err
++}
++
++func record(tags *tag.Map, ms interface{}, attachments map[string]interface{}) {
++	defaultWorker.Record(tags, ms, attachments)
++}
++
++// Record records a set of measurements ms associated with the given tags and attachments.
++func (w *worker) Record(tags *tag.Map, ms interface{}, attachments map[string]interface{}) {
++	req := &recordReq{
++		tm:          tags,
++		ms:          ms.([]stats.Measurement),
++		attachments: attachments,
++		t:           time.Now(),
++	}
++	w.c <- req
++}
++
++// SetReportingPeriod sets the interval between reporting aggregated views in
++// the program. If duration is less than or equal to zero, it enables the
++// default behavior.
++//
++// Note: each exporter makes different promises about what the lowest supported
++// duration is. For example, the Stackdriver exporter recommends a value no
++// lower than 1 minute. Consult each exporter per your needs.
++func SetReportingPeriod(d time.Duration) {
++	defaultWorker.SetReportingPeriod(d)
++}
++
++// SetReportingPeriod sets the interval between reporting aggregated views in
++// the program. If duration is less than or equal to zero, it enables the
++// default behavior.
++//
++// Note: each exporter makes different promises about what the lowest supported
++// duration is. For example, the Stackdriver exporter recommends a value no
++// lower than 1 minute. Consult each exporter per your needs.
++func (w *worker) SetReportingPeriod(d time.Duration) {
++	// TODO(acetechnologist): ensure that the duration d is more than a certain
++	// value. e.g. 1s
++	req := &setReportingPeriodReq{
++		d: d,
++		c: make(chan bool),
++	}
++	w.c <- req
++	<-req.c // don't return until the timer is set to the new duration.
++}
++
++// NewMeter constructs a Meter instance. You should only need to use this if
++// you need to separate out Measurement recordings and View aggregations within
++// a single process.
++func NewMeter() Meter {
++	return &worker{
++		measures:       make(map[string]*measureRef),
++		views:          make(map[string]*viewInternal),
++		viewStartTimes: make(map[*viewInternal]time.Time),
++		timer:          time.NewTicker(defaultReportingDuration),
++		c:              make(chan command, 1024),
++		quit:           make(chan bool),
++		done:           make(chan bool),
++
++		exporters: make(map[Exporter]struct{}),
++	}
++}
++
++// SetResource associates all data collected by this Meter with the specified
++// resource. This resource is reported when using metricexport.ReadAndExport;
++// it is not provided when used with ExportView/RegisterExporter, because that
++// interface does not provide a means for reporting the Resource.
++func (w *worker) SetResource(r *resource.Resource) {
++	w.r = r
++}
++
++func (w *worker) Start() {
++	go w.start()
++}
++
++func (w *worker) start() {
++	prodMgr := metricproducer.GlobalManager()
++	prodMgr.AddProducer(w)
++
++	for {
++		select {
++		case cmd := <-w.c:
++			cmd.handleCommand(w)
++		case <-w.timer.C:
++			w.reportUsage()
++		case <-w.quit:
++			w.timer.Stop()
++			close(w.c)
++			w.done <- true
++			return
++		}
++	}
++}
++
++func (w *worker) Stop() {
++	prodMgr := metricproducer.GlobalManager()
++	prodMgr.DeleteProducer(w)
++
++	w.quit <- true
++	<-w.done
++}
++
++func (w *worker) getMeasureRef(name string) *measureRef {
++	if mr, ok := w.measures[name]; ok {
++		return mr
++	}
++	mr := &measureRef{
++		measure: name,
++		views:   make(map[*viewInternal]struct{}),
++	}
++	w.measures[name] = mr
++	return mr
++}
++
++func (w *worker) tryRegisterView(v *View) (*viewInternal, error) {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	vi, err := newViewInternal(v)
++	if err != nil {
++		return nil, err
++	}
++	if x, ok := w.views[vi.view.Name]; ok {
++		if !x.view.same(vi.view) {
++			return nil, fmt.Errorf("cannot register view %q; a different view with the same name is already registered", v.Name)
++		}
++
++		// the view is already registered so there is nothing to do and the
++		// command is considered successful.
++		return x, nil
++	}
++	w.views[vi.view.Name] = vi
++	w.viewStartTimes[vi] = time.Now()
++	ref := w.getMeasureRef(vi.view.Measure.Name())
++	ref.views[vi] = struct{}{}
++	return vi, nil
++}
++
++func (w *worker) unregisterView(v *viewInternal) {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	delete(w.views, v.view.Name)
++	delete(w.viewStartTimes, v)
++	if measure := w.measures[v.view.Measure.Name()]; measure != nil {
++		delete(measure.views, v)
++	}
++}
++
++func (w *worker) reportView(v *viewInternal) {
++	if !v.isSubscribed() {
++		return
++	}
++	rows := v.collectedRows()
++	viewData := &Data{
++		View:  v.view,
++		Start: w.viewStartTimes[v],
++		End:   time.Now(),
++		Rows:  rows,
++	}
++	w.exportersMu.Lock()
++	defer w.exportersMu.Unlock()
++	for e := range w.exporters {
++		e.ExportView(viewData)
++	}
++}
++
++func (w *worker) reportUsage() {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	for _, v := range w.views {
++		w.reportView(v)
++	}
++}
++
++func (w *worker) toMetric(v *viewInternal, now time.Time) *metricdata.Metric {
++	if !v.isSubscribed() {
++		return nil
++	}
++
++	return viewToMetric(v, w.r, now)
++}
++
++// Read reads all view data and returns them as metrics.
++// It is typically invoked by metric reader to export stats in metric format.
++func (w *worker) Read() []*metricdata.Metric {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	now := time.Now()
++	metrics := make([]*metricdata.Metric, 0, len(w.views))
++	for _, v := range w.views {
++		metric := w.toMetric(v, now)
++		if metric != nil {
++			metrics = append(metrics, metric)
++		}
++	}
++	return metrics
++}
++
++func (w *worker) RegisterExporter(e Exporter) {
++	w.exportersMu.Lock()
++	defer w.exportersMu.Unlock()
++
++	w.exporters[e] = struct{}{}
++}
++
++func (w *worker) UnregisterExporter(e Exporter) {
++	w.exportersMu.Lock()
++	defer w.exportersMu.Unlock()
++
++	delete(w.exporters, e)
++}
+diff --git a/vendor/go.opencensus.io/stats/view/worker_commands.go b/vendor/go.opencensus.io/stats/view/worker_commands.go
+new file mode 100644
+index 000000000..9ac4cc059
+--- /dev/null
++++ b/vendor/go.opencensus.io/stats/view/worker_commands.go
+@@ -0,0 +1,186 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package view
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"time"
++
++	"go.opencensus.io/stats"
++	"go.opencensus.io/stats/internal"
++	"go.opencensus.io/tag"
++)
++
++type command interface {
++	handleCommand(w *worker)
++}
++
++// getViewByNameReq is the command to get a view given its name.
++type getViewByNameReq struct {
++	name string
++	c    chan *getViewByNameResp
++}
++
++type getViewByNameResp struct {
++	v *View
++}
++
++func (cmd *getViewByNameReq) handleCommand(w *worker) {
++	v := w.views[cmd.name]
++	if v == nil {
++		cmd.c <- &getViewByNameResp{nil}
++		return
++	}
++	cmd.c <- &getViewByNameResp{v.view}
++}
++
++// registerViewReq is the command to register a view.
++type registerViewReq struct {
++	views []*View
++	err   chan error
++}
++
++func (cmd *registerViewReq) handleCommand(w *worker) {
++	for _, v := range cmd.views {
++		if err := v.canonicalize(); err != nil {
++			cmd.err <- err
++			return
++		}
++	}
++	var errstr []string
++	for _, view := range cmd.views {
++		vi, err := w.tryRegisterView(view)
++		if err != nil {
++			errstr = append(errstr, fmt.Sprintf("%s: %v", view.Name, err))
++			continue
++		}
++		internal.SubscriptionReporter(view.Measure.Name())
++		vi.subscribe()
++	}
++	if len(errstr) > 0 {
++		cmd.err <- errors.New(strings.Join(errstr, "\n"))
++	} else {
++		cmd.err <- nil
++	}
++}
++
++// unregisterFromViewReq is the command to unregister to a view. Has no
++// impact on the data collection for client that are pulling data from the
++// library.
++type unregisterFromViewReq struct {
++	views []string
++	done  chan struct{}
++}
++
++func (cmd *unregisterFromViewReq) handleCommand(w *worker) {
++	for _, name := range cmd.views {
++		vi, ok := w.views[name]
++		if !ok {
++			continue
++		}
++
++		// Report pending data for this view before removing it.
++		w.reportView(vi)
++
++		vi.unsubscribe()
++		if !vi.isSubscribed() {
++			// this was the last subscription and view is not collecting anymore.
++			// The collected data can be cleared.
++			vi.clearRows()
++		}
++		w.unregisterView(vi)
++	}
++	cmd.done <- struct{}{}
++}
++
++// retrieveDataReq is the command to retrieve data for a view.
++type retrieveDataReq struct {
++	now time.Time
++	v   string
++	c   chan *retrieveDataResp
++}
++
++type retrieveDataResp struct {
++	rows []*Row
++	err  error
++}
++
++func (cmd *retrieveDataReq) handleCommand(w *worker) {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	vi, ok := w.views[cmd.v]
++	if !ok {
++		cmd.c <- &retrieveDataResp{
++			nil,
++			fmt.Errorf("cannot retrieve data; view %q is not registered", cmd.v),
++		}
++		return
++	}
++
++	if !vi.isSubscribed() {
++		cmd.c <- &retrieveDataResp{
++			nil,
++			fmt.Errorf("cannot retrieve data; view %q has no subscriptions or collection is not forcibly started", cmd.v),
++		}
++		return
++	}
++	cmd.c <- &retrieveDataResp{
++		vi.collectedRows(),
++		nil,
++	}
++}
++
++// recordReq is the command to record data related to multiple measures
++// at once.
++type recordReq struct {
++	tm          *tag.Map
++	ms          []stats.Measurement
++	attachments map[string]interface{}
++	t           time.Time
++}
++
++func (cmd *recordReq) handleCommand(w *worker) {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	for _, m := range cmd.ms {
++		if (m == stats.Measurement{}) { // not registered
++			continue
++		}
++		ref := w.getMeasureRef(m.Measure().Name())
++		for v := range ref.views {
++			v.addSample(cmd.tm, m.Value(), cmd.attachments, cmd.t)
++		}
++	}
++}
++
++// setReportingPeriodReq is the command to modify the duration between
++// reporting the collected data to the registered clients.
++type setReportingPeriodReq struct {
++	d time.Duration
++	c chan bool
++}
++
++func (cmd *setReportingPeriodReq) handleCommand(w *worker) {
++	w.timer.Stop()
++	if cmd.d <= 0 {
++		w.timer = time.NewTicker(defaultReportingDuration)
++	} else {
++		w.timer = time.NewTicker(cmd.d)
++	}
++	cmd.c <- true
++}
+diff --git a/vendor/go.opencensus.io/tag/context.go b/vendor/go.opencensus.io/tag/context.go
+new file mode 100644
+index 000000000..b27d1b26b
+--- /dev/null
++++ b/vendor/go.opencensus.io/tag/context.go
+@@ -0,0 +1,43 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package tag
++
++import (
++	"context"
++)
++
++// FromContext returns the tag map stored in the context.
++func FromContext(ctx context.Context) *Map {
++	// The returned tag map shouldn't be mutated.
++	ts := ctx.Value(mapCtxKey)
++	if ts == nil {
++		return nil
++	}
++	return ts.(*Map)
++}
++
++// NewContext creates a new context with the given tag map.
++// To propagate a tag map to downstream methods and downstream RPCs, add a tag map
++// to the current context. NewContext will return a copy of the current context,
++// and put the tag map into the returned one.
++// If there is already a tag map in the current context, it will be replaced with m.
++func NewContext(ctx context.Context, m *Map) context.Context {
++	return context.WithValue(ctx, mapCtxKey, m)
++}
++
++type ctxKey struct{}
++
++var mapCtxKey = ctxKey{}
+diff --git a/vendor/go.opencensus.io/tag/doc.go b/vendor/go.opencensus.io/tag/doc.go
+new file mode 100644
+index 000000000..da16b74e4
+--- /dev/null
++++ b/vendor/go.opencensus.io/tag/doc.go
+@@ -0,0 +1,26 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++/*
++Package tag contains OpenCensus tags.
++
++Tags are key-value pairs. Tags provide additional cardinality to
++the OpenCensus instrumentation data.
++
++Tags can be propagated on the wire and in the same
++process via context.Context. Encode and Decode should be
++used to represent tags into their binary propagation form.
++*/
++package tag // import "go.opencensus.io/tag"
+diff --git a/vendor/go.opencensus.io/tag/key.go b/vendor/go.opencensus.io/tag/key.go
+new file mode 100644
+index 000000000..71ec91365
+--- /dev/null
++++ b/vendor/go.opencensus.io/tag/key.go
+@@ -0,0 +1,44 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package tag
++
++// Key represents a tag key.
++type Key struct {
++	name string
++}
++
++// NewKey creates or retrieves a string key identified by name.
++// Calling NewKey more than once with the same name returns the same key.
++func NewKey(name string) (Key, error) {
++	if !checkKeyName(name) {
++		return Key{}, errInvalidKeyName
++	}
++	return Key{name: name}, nil
++}
++
++// MustNewKey returns a key with the given name, and panics if name is an invalid key name.
++func MustNewKey(name string) Key {
++	k, err := NewKey(name)
++	if err != nil {
++		panic(err)
++	}
++	return k
++}
++
++// Name returns the name of the key.
++func (k Key) Name() string {
++	return k.name
++}
+diff --git a/vendor/go.opencensus.io/tag/map.go b/vendor/go.opencensus.io/tag/map.go
+new file mode 100644
+index 000000000..0272ef85a
+--- /dev/null
++++ b/vendor/go.opencensus.io/tag/map.go
+@@ -0,0 +1,229 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package tag
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"sort"
++)
++
++// Tag is a key value pair that can be propagated on wire.
++type Tag struct {
++	Key   Key
++	Value string
++}
++
++type tagContent struct {
++	value string
++	m     metadatas
++}
++
++// Map is a map of tags. Use New to create a context containing
++// a new Map.
++type Map struct {
++	m map[Key]tagContent
++}
++
++// Value returns the value for the key if a value for the key exists.
++func (m *Map) Value(k Key) (string, bool) {
++	if m == nil {
++		return "", false
++	}
++	v, ok := m.m[k]
++	return v.value, ok
++}
++
++func (m *Map) String() string {
++	if m == nil {
++		return "nil"
++	}
++	keys := make([]Key, 0, len(m.m))
++	for k := range m.m {
++		keys = append(keys, k)
++	}
++	sort.Slice(keys, func(i, j int) bool { return keys[i].Name() < keys[j].Name() })
++
++	var buffer bytes.Buffer
++	buffer.WriteString("{ ")
++	for _, k := range keys {
++		buffer.WriteString(fmt.Sprintf("{%v %v}", k.name, m.m[k]))
++	}
++	buffer.WriteString(" }")
++	return buffer.String()
++}
++
++func (m *Map) insert(k Key, v string, md metadatas) {
++	if _, ok := m.m[k]; ok {
++		return
++	}
++	m.m[k] = tagContent{value: v, m: md}
++}
++
++func (m *Map) update(k Key, v string, md metadatas) {
++	if _, ok := m.m[k]; ok {
++		m.m[k] = tagContent{value: v, m: md}
++	}
++}
++
++func (m *Map) upsert(k Key, v string, md metadatas) {
++	m.m[k] = tagContent{value: v, m: md}
++}
++
++func (m *Map) delete(k Key) {
++	delete(m.m, k)
++}
++
++func newMap() *Map {
++	return &Map{m: make(map[Key]tagContent)}
++}
++
++// Mutator modifies a tag map.
++type Mutator interface {
++	Mutate(t *Map) (*Map, error)
++}
++
++// Insert returns a mutator that inserts a
++// value associated with k. If k already exists in the tag map,
++// mutator doesn't update the value.
++// Metadata applies metadata to the tag. It is optional.
++// Metadatas are applied in the order in which it is provided.
++// If more than one metadata updates the same attribute then
++// the update from the last metadata prevails.
++func Insert(k Key, v string, mds ...Metadata) Mutator {
++	return &mutator{
++		fn: func(m *Map) (*Map, error) {
++			if !checkValue(v) {
++				return nil, errInvalidValue
++			}
++			m.insert(k, v, createMetadatas(mds...))
++			return m, nil
++		},
++	}
++}
++
++// Update returns a mutator that updates the
++// value of the tag associated with k with v. If k doesn't
++// exists in the tag map, the mutator doesn't insert the value.
++// Metadata applies metadata to the tag. It is optional.
++// Metadatas are applied in the order in which it is provided.
++// If more than one metadata updates the same attribute then
++// the update from the last metadata prevails.
++func Update(k Key, v string, mds ...Metadata) Mutator {
++	return &mutator{
++		fn: func(m *Map) (*Map, error) {
++			if !checkValue(v) {
++				return nil, errInvalidValue
++			}
++			m.update(k, v, createMetadatas(mds...))
++			return m, nil
++		},
++	}
++}
++
++// Upsert returns a mutator that upserts the
++// value of the tag associated with k with v. It inserts the
++// value if k doesn't exist already. It mutates the value
++// if k already exists.
++// Metadata applies metadata to the tag. It is optional.
++// Metadatas are applied in the order in which it is provided.
++// If more than one metadata updates the same attribute then
++// the update from the last metadata prevails.
++func Upsert(k Key, v string, mds ...Metadata) Mutator {
++	return &mutator{
++		fn: func(m *Map) (*Map, error) {
++			if !checkValue(v) {
++				return nil, errInvalidValue
++			}
++			m.upsert(k, v, createMetadatas(mds...))
++			return m, nil
++		},
++	}
++}
++
++func createMetadatas(mds ...Metadata) metadatas {
++	var metas metadatas
++	if len(mds) > 0 {
++		for _, md := range mds {
++			if md != nil {
++				md(&metas)
++			}
++		}
++	} else {
++		WithTTL(TTLUnlimitedPropagation)(&metas)
++	}
++	return metas
++
++}
++
++// Delete returns a mutator that deletes
++// the value associated with k.
++func Delete(k Key) Mutator {
++	return &mutator{
++		fn: func(m *Map) (*Map, error) {
++			m.delete(k)
++			return m, nil
++		},
++	}
++}
++
++// New returns a new context that contains a tag map
++// originated from the incoming context and modified
++// with the provided mutators.
++func New(ctx context.Context, mutator ...Mutator) (context.Context, error) {
++	m := newMap()
++	orig := FromContext(ctx)
++	if orig != nil {
++		for k, v := range orig.m {
++			if !checkKeyName(k.Name()) {
++				return ctx, fmt.Errorf("key:%q: %v", k, errInvalidKeyName)
++			}
++			if !checkValue(v.value) {
++				return ctx, fmt.Errorf("key:%q value:%q: %v", k.Name(), v, errInvalidValue)
++			}
++			m.insert(k, v.value, v.m)
++		}
++	}
++	var err error
++	for _, mod := range mutator {
++		m, err = mod.Mutate(m)
++		if err != nil {
++			return ctx, err
++		}
++	}
++	return NewContext(ctx, m), nil
++}
++
++// Do is similar to pprof.Do: a convenience for installing the tags
++// from the context as Go profiler labels. This allows you to
++// correlated runtime profiling with stats.
++//
++// It converts the key/values from the given map to Go profiler labels
++// and calls pprof.Do.
++//
++// Do is going to do nothing if your Go version is below 1.9.
++func Do(ctx context.Context, f func(ctx context.Context)) {
++	do(ctx, f)
++}
++
++type mutator struct {
++	fn func(t *Map) (*Map, error)
++}
++
++func (m *mutator) Mutate(t *Map) (*Map, error) {
++	return m.fn(t)
++}
+diff --git a/vendor/go.opencensus.io/tag/map_codec.go b/vendor/go.opencensus.io/tag/map_codec.go
+new file mode 100644
+index 000000000..c242e695c
+--- /dev/null
++++ b/vendor/go.opencensus.io/tag/map_codec.go
+@@ -0,0 +1,239 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package tag
++
++import (
++	"encoding/binary"
++	"fmt"
++)
++
++// KeyType defines the types of keys allowed. Currently only keyTypeString is
++// supported.
++type keyType byte
++
++const (
++	keyTypeString keyType = iota
++	keyTypeInt64
++	keyTypeTrue
++	keyTypeFalse
++
++	tagsVersionID = byte(0)
++)
++
++type encoderGRPC struct {
++	buf               []byte
++	writeIdx, readIdx int
++}
++
++// writeKeyString writes the fieldID '0' followed by the key string and value
++// string.
++func (eg *encoderGRPC) writeTagString(k, v string) {
++	eg.writeByte(byte(keyTypeString))
++	eg.writeStringWithVarintLen(k)
++	eg.writeStringWithVarintLen(v)
++}
++
++func (eg *encoderGRPC) writeTagUint64(k string, i uint64) {
++	eg.writeByte(byte(keyTypeInt64))
++	eg.writeStringWithVarintLen(k)
++	eg.writeUint64(i)
++}
++
++func (eg *encoderGRPC) writeTagTrue(k string) {
++	eg.writeByte(byte(keyTypeTrue))
++	eg.writeStringWithVarintLen(k)
++}
++
++func (eg *encoderGRPC) writeTagFalse(k string) {
++	eg.writeByte(byte(keyTypeFalse))
++	eg.writeStringWithVarintLen(k)
++}
++
++func (eg *encoderGRPC) writeBytesWithVarintLen(bytes []byte) {
++	length := len(bytes)
++
++	eg.growIfRequired(binary.MaxVarintLen64 + length)
++	eg.writeIdx += binary.PutUvarint(eg.buf[eg.writeIdx:], uint64(length))
++	copy(eg.buf[eg.writeIdx:], bytes)
++	eg.writeIdx += length
++}
++
++func (eg *encoderGRPC) writeStringWithVarintLen(s string) {
++	length := len(s)
++
++	eg.growIfRequired(binary.MaxVarintLen64 + length)
++	eg.writeIdx += binary.PutUvarint(eg.buf[eg.writeIdx:], uint64(length))
++	copy(eg.buf[eg.writeIdx:], s)
++	eg.writeIdx += length
++}
++
++func (eg *encoderGRPC) writeByte(v byte) {
++	eg.growIfRequired(1)
++	eg.buf[eg.writeIdx] = v
++	eg.writeIdx++
++}
++
++func (eg *encoderGRPC) writeUint32(i uint32) {
++	eg.growIfRequired(4)
++	binary.LittleEndian.PutUint32(eg.buf[eg.writeIdx:], i)
++	eg.writeIdx += 4
++}
++
++func (eg *encoderGRPC) writeUint64(i uint64) {
++	eg.growIfRequired(8)
++	binary.LittleEndian.PutUint64(eg.buf[eg.writeIdx:], i)
++	eg.writeIdx += 8
++}
++
++func (eg *encoderGRPC) readByte() byte {
++	b := eg.buf[eg.readIdx]
++	eg.readIdx++
++	return b
++}
++
++func (eg *encoderGRPC) readUint32() uint32 {
++	i := binary.LittleEndian.Uint32(eg.buf[eg.readIdx:])
++	eg.readIdx += 4
++	return i
++}
++
++func (eg *encoderGRPC) readUint64() uint64 {
++	i := binary.LittleEndian.Uint64(eg.buf[eg.readIdx:])
++	eg.readIdx += 8
++	return i
++}
++
++func (eg *encoderGRPC) readBytesWithVarintLen() ([]byte, error) {
++	if eg.readEnded() {
++		return nil, fmt.Errorf("unexpected end while readBytesWithVarintLen '%x' starting at idx '%v'", eg.buf, eg.readIdx)
++	}
++	length, valueStart := binary.Uvarint(eg.buf[eg.readIdx:])
++	if valueStart <= 0 {
++		return nil, fmt.Errorf("unexpected end while readBytesWithVarintLen '%x' starting at idx '%v'", eg.buf, eg.readIdx)
++	}
++
++	valueStart += eg.readIdx
++	valueEnd := valueStart + int(length)
++	if valueEnd > len(eg.buf) {
++		return nil, fmt.Errorf("malformed encoding: length:%v, upper:%v, maxLength:%v", length, valueEnd, len(eg.buf))
++	}
++
++	eg.readIdx = valueEnd
++	return eg.buf[valueStart:valueEnd], nil
++}
++
++func (eg *encoderGRPC) readStringWithVarintLen() (string, error) {
++	bytes, err := eg.readBytesWithVarintLen()
++	if err != nil {
++		return "", err
++	}
++	return string(bytes), nil
++}
++
++func (eg *encoderGRPC) growIfRequired(expected int) {
++	if len(eg.buf)-eg.writeIdx < expected {
++		tmp := make([]byte, 2*(len(eg.buf)+1)+expected)
++		copy(tmp, eg.buf)
++		eg.buf = tmp
++	}
++}
++
++func (eg *encoderGRPC) readEnded() bool {
++	return eg.readIdx >= len(eg.buf)
++}
++
++func (eg *encoderGRPC) bytes() []byte {
++	return eg.buf[:eg.writeIdx]
++}
++
++// Encode encodes the tag map into a []byte. It is useful to propagate
++// the tag maps on wire in binary format.
++func Encode(m *Map) []byte {
++	if m == nil {
++		return nil
++	}
++	eg := &encoderGRPC{
++		buf: make([]byte, len(m.m)),
++	}
++	eg.writeByte(tagsVersionID)
++	for k, v := range m.m {
++		if v.m.ttl.ttl == valueTTLUnlimitedPropagation {
++			eg.writeByte(byte(keyTypeString))
++			eg.writeStringWithVarintLen(k.name)
++			eg.writeBytesWithVarintLen([]byte(v.value))
++		}
++	}
++	return eg.bytes()
++}
++
++// Decode decodes the given []byte into a tag map.
++func Decode(bytes []byte) (*Map, error) {
++	ts := newMap()
++	err := DecodeEach(bytes, ts.upsert)
++	if err != nil {
++		// no partial failures
++		return nil, err
++	}
++	return ts, nil
++}
++
++// DecodeEach decodes the given serialized tag map, calling handler for each
++// tag key and value decoded.
++func DecodeEach(bytes []byte, fn func(key Key, val string, md metadatas)) error {
++	eg := &encoderGRPC{
++		buf: bytes,
++	}
++	if len(eg.buf) == 0 {
++		return nil
++	}
++
++	version := eg.readByte()
++	if version > tagsVersionID {
++		return fmt.Errorf("cannot decode: unsupported version: %q; supports only up to: %q", version, tagsVersionID)
++	}
++
++	for !eg.readEnded() {
++		typ := keyType(eg.readByte())
++
++		if typ != keyTypeString {
++			return fmt.Errorf("cannot decode: invalid key type: %q", typ)
++		}
++
++		k, err := eg.readBytesWithVarintLen()
++		if err != nil {
++			return err
++		}
++
++		v, err := eg.readBytesWithVarintLen()
++		if err != nil {
++			return err
++		}
++
++		key, err := NewKey(string(k))
++		if err != nil {
++			return err
++		}
++		val := string(v)
++		if !checkValue(val) {
++			return errInvalidValue
++		}
++		fn(key, val, createMetadatas(WithTTL(TTLUnlimitedPropagation)))
++		if err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/vendor/go.opencensus.io/tag/metadata.go b/vendor/go.opencensus.io/tag/metadata.go
+new file mode 100644
+index 000000000..6571a583e
+--- /dev/null
++++ b/vendor/go.opencensus.io/tag/metadata.go
+@@ -0,0 +1,52 @@
++// Copyright 2019, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++package tag
++
++const (
++	// valueTTLNoPropagation prevents tag from propagating.
++	valueTTLNoPropagation = 0
++
++	// valueTTLUnlimitedPropagation allows tag to propagate without any limits on number of hops.
++	valueTTLUnlimitedPropagation = -1
++)
++
++// TTL is metadata that specifies number of hops a tag can propagate.
++// Details about TTL metadata is specified at https://github.com/census-instrumentation/opencensus-specs/blob/master/tags/TagMap.md#tagmetadata
++type TTL struct {
++	ttl int
++}
++
++var (
++	// TTLUnlimitedPropagation is TTL metadata that allows tag to propagate without any limits on number of hops.
++	TTLUnlimitedPropagation = TTL{ttl: valueTTLUnlimitedPropagation}
++
++	// TTLNoPropagation is TTL metadata that prevents tag from propagating.
++	TTLNoPropagation = TTL{ttl: valueTTLNoPropagation}
++)
++
++type metadatas struct {
++	ttl TTL
++}
++
++// Metadata applies metadatas specified by the function.
++type Metadata func(*metadatas)
++
++// WithTTL applies metadata with provided ttl.
++func WithTTL(ttl TTL) Metadata {
++	return func(m *metadatas) {
++		m.ttl = ttl
++	}
++}
+diff --git a/vendor/go.opencensus.io/tag/profile_19.go b/vendor/go.opencensus.io/tag/profile_19.go
+new file mode 100644
+index 000000000..b34d95e34
+--- /dev/null
++++ b/vendor/go.opencensus.io/tag/profile_19.go
+@@ -0,0 +1,31 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build go1.9
++
++package tag
++
++import (
++	"context"
++	"runtime/pprof"
++)
++
++func do(ctx context.Context, f func(ctx context.Context)) {
++	m := FromContext(ctx)
++	keyvals := make([]string, 0, 2*len(m.m))
++	for k, v := range m.m {
++		keyvals = append(keyvals, k.Name(), v.value)
++	}
++	pprof.Do(ctx, pprof.Labels(keyvals...), f)
++}
+diff --git a/vendor/go.opencensus.io/tag/profile_not19.go b/vendor/go.opencensus.io/tag/profile_not19.go
+new file mode 100644
+index 000000000..83adbce56
+--- /dev/null
++++ b/vendor/go.opencensus.io/tag/profile_not19.go
+@@ -0,0 +1,23 @@
++// Copyright 2018, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build !go1.9
++
++package tag
++
++import "context"
++
++func do(ctx context.Context, f func(ctx context.Context)) {
++	f(ctx)
++}
+diff --git a/vendor/go.opencensus.io/tag/validate.go b/vendor/go.opencensus.io/tag/validate.go
+new file mode 100644
+index 000000000..0939fc674
+--- /dev/null
++++ b/vendor/go.opencensus.io/tag/validate.go
+@@ -0,0 +1,56 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package tag
++
++import "errors"
++
++const (
++	maxKeyLength = 255
++
++	// valid are restricted to US-ASCII subset (range 0x20 (' ') to 0x7e ('~')).
++	validKeyValueMin = 32
++	validKeyValueMax = 126
++)
++
++var (
++	errInvalidKeyName = errors.New("invalid key name: only ASCII characters accepted; max length must be 255 characters")
++	errInvalidValue   = errors.New("invalid value: only ASCII characters accepted; max length must be 255 characters")
++)
++
++func checkKeyName(name string) bool {
++	if len(name) == 0 {
++		return false
++	}
++	if len(name) > maxKeyLength {
++		return false
++	}
++	return isASCII(name)
++}
++
++func isASCII(s string) bool {
++	for _, c := range s {
++		if (c < validKeyValueMin) || (c > validKeyValueMax) {
++			return false
++		}
++	}
++	return true
++}
++
++func checkValue(v string) bool {
++	if len(v) > maxKeyLength {
++		return false
++	}
++	return isASCII(v)
++}
+diff --git a/vendor/go.opencensus.io/trace/propagation/propagation.go b/vendor/go.opencensus.io/trace/propagation/propagation.go
+new file mode 100644
+index 000000000..1eb190a96
+--- /dev/null
++++ b/vendor/go.opencensus.io/trace/propagation/propagation.go
+@@ -0,0 +1,108 @@
++// Copyright 2017, OpenCensus Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package propagation implements the binary trace context format.
++package propagation // import "go.opencensus.io/trace/propagation"
++
++// TODO: link to external spec document.
++
++// BinaryFormat format:
++//
++// Binary value: <version_id><version_format>
++// version_id: 1 byte representing the version id.
++//
++// For version_id = 0:
++//
++// version_format: <field><field>
++// field_format: <field_id><field_format>
++//
++// Fields:
++//
++// TraceId: (field_id = 0, len = 16, default = "0000000000000000") - 16-byte array representing the trace_id.
++// SpanId: (field_id = 1, len = 8, default = "00000000") - 8-byte array representing the span_id.
++// TraceOptions: (field_id = 2, len = 1, default = "0") - 1-byte array representing the trace_options.
++//
++// Fields MUST be encoded using the field id order (smaller to higher).
++//
++// Valid value example:
++//
++// {0, 0, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 1, 97,
++// 98, 99, 100, 101, 102, 103, 104, 2, 1}
++//
++// version_id = 0;
++// trace_id = {64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79}
++// span_id = {97, 98, 99, 100, 101, 102, 103, 104};
++// trace_options = {1};
++
++import (
++	"net/http"
++
++	"go.opencensus.io/trace"
++)
++
++// Binary returns the binary format representation of a SpanContext.
++//
++// If sc is the zero value, Binary returns nil.
++func Binary(sc trace.SpanContext) []byte {
++	if sc == (trace.SpanContext{}) {
++		return nil
++	}
++	var b [29]byte
++	copy(b[2:18], sc.TraceID[:])
++	b[18] = 1
++	copy(b[19:27], sc.SpanID[:])
++	b[27] = 2
++	b[28] = uint8(sc.TraceOptions)
++	return b[:]
++}
++
++// FromBinary returns the SpanContext represented by b.
++//
++// If b has an unsupported version ID or contains no TraceID, FromBinary
++// returns with ok==false.
++func FromBinary(b []byte) (sc trace.SpanContext, ok bool) {
++	if len(b) == 0 || b[0] != 0 {
++		return trace.SpanContext{}, false
++	}
++	b = b[1:]
++	if len(b) >= 17 && b[0] == 0 {
++		copy(sc.TraceID[:], b[1:17])
++		b = b[17:]
++	} else {
++		return trace.SpanContext{}, false
++	}
++	if len(b) >= 9 && b[0] == 1 {
++		copy(sc.SpanID[:], b[1:9])
++		b = b[9:]
++	}
++	if len(b) >= 2 && b[0] == 2 {
++		sc.TraceOptions = trace.TraceOptions(b[1])
++	}
++	return sc, true
++}
++
++// HTTPFormat implementations propagate span contexts
++// in HTTP requests.
++//
++// SpanContextFromRequest extracts a span context from incoming
++// requests.
++//
++// SpanContextToRequest modifies the given request to include the given
++// span context.
++type HTTPFormat interface {
++	SpanContextFromRequest(req *http.Request) (sc trace.SpanContext, ok bool)
++	SpanContextToRequest(sc trace.SpanContext, req *http.Request)
++}
++
++// TODO(jbd): Find a more representative but short name for HTTPFormat.
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 7b86a9c1b..8728cb8d7 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -437,8 +437,18 @@ go.mozilla.org/pkcs7
+ ## explicit; go 1.13
+ go.opencensus.io
+ go.opencensus.io/internal
++go.opencensus.io/internal/tagencoding
++go.opencensus.io/metric/metricdata
++go.opencensus.io/metric/metricproducer
++go.opencensus.io/plugin/ocgrpc
++go.opencensus.io/resource
++go.opencensus.io/stats
++go.opencensus.io/stats/internal
++go.opencensus.io/stats/view
++go.opencensus.io/tag
+ go.opencensus.io/trace
+ go.opencensus.io/trace/internal
++go.opencensus.io/trace/propagation
+ go.opencensus.io/trace/tracestate
+ # go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.28.0
+ ## explicit; go 1.16

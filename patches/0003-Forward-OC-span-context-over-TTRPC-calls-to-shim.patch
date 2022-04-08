@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kevin Parsons <kevpar@microsoft.com>
+Date: Sat, 24 Aug 2019 22:03:13 -0700
+Subject: [PATCH] Forward OC span context over TTRPC calls to shim
+
+This commit also revendors Microsoft/hcsshim to bring in the octtrpc
+package.
+
+Signed-off-by: Kevin Parsons <kevpar@microsoft.com>
+---
+ runtime/v2/binary.go                          |   3 +-
+ vendor.conf                                   |  88 +++++++++++++
+ .../hcsshim/pkg/octtrpc/interceptor.go        | 121 ++++++++++++++++++
+ vendor/modules.txt                            |   1 +
+ 4 files changed, 212 insertions(+), 1 deletion(-)
+ create mode 100644 vendor.conf
+ create mode 100644 vendor/github.com/Microsoft/hcsshim/pkg/octtrpc/interceptor.go
+
+diff --git a/runtime/v2/binary.go b/runtime/v2/binary.go
+index 99e8ab485..1a8774956 100644
+--- a/runtime/v2/binary.go
++++ b/runtime/v2/binary.go
+@@ -26,6 +26,7 @@ import (
+ 	gruntime "runtime"
+ 	"strings"
+ 
++	"github.com/Microsoft/hcsshim/pkg/octtrpc"
+ 	"github.com/containerd/containerd/log"
+ 	"github.com/containerd/containerd/namespaces"
+ 	"github.com/containerd/containerd/runtime"
+@@ -132,7 +133,7 @@ func (b *binary) Start(ctx context.Context, opts *types.Any, onClose func()) (_
+ 	if err := os.WriteFile(filepath.Join(b.bundle.Path, "shim-binary-path"), []byte(b.runtime), 0600); err != nil {
+ 		return nil, err
+ 	}
+-	client := ttrpc.NewClient(conn, ttrpc.WithOnClose(onCloseWithShimLog))
++	client := ttrpc.NewClient(conn, ttrpc.WithOnClose(onCloseWithShimLog), ttrpc.WithUnaryClientInterceptor(octtrpc.ClientInterceptor()))
+ 	return &shim{
+ 		bundle: b.bundle,
+ 		client: client,
+diff --git a/vendor.conf b/vendor.conf
+new file mode 100644
+index 000000000..dcf5ce227
+--- /dev/null
++++ b/vendor.conf
+@@ -0,0 +1,88 @@
++github.com/containerd/go-runc 9007c2405372fe28918845901a3276c0915689a1
++github.com/containerd/console 0650fd9eeb50bab4fc99dceb9f2e14cf58f36e7f
++github.com/containerd/cgroups c4b9ac5c7601384c965b9646fc515884e091ebb9
++github.com/containerd/typeurl a93fcdb778cd272c6e9b3028b2f42d813e785d40
++github.com/containerd/fifo bda0ff6ed73c67bfb5e62bc9c697f146b7fd7f13
++github.com/containerd/btrfs af5082808c833de0e79c1e72eea9fea239364877
++github.com/containerd/continuity f2a389ac0a02ce21c09edd7344677a601970f41c
++github.com/coreos/go-systemd 48702e0da86bd25e76cfef347e2adeb434a0d0a6
++github.com/docker/go-metrics 4ea375f7759c82740c893fc030bc37088d2ec098
++github.com/docker/go-events 9461782956ad83b30282bf90e31fa6a70c255ba9
++github.com/docker/go-units v0.4.0
++github.com/godbus/dbus c7fdd8b5cd55e87b4e1f4e372cdb1db61dd6c66f
++github.com/prometheus/client_golang f4fb1b73fb099f396a7f0036bf86aa8def4ed823
++github.com/prometheus/client_model 99fa1f4be8e564e8a6b613da7fa6f46c9edafc6c
++github.com/prometheus/common 89604d197083d4781071d3c65855d24ecfb0a563
++github.com/prometheus/procfs cb4147076ac75738c9a7d279075a253c0cc5acbd
++github.com/beorn7/perks 4c0e84591b9aa9e6dcfdf3e020114cd81f89d5f9
++github.com/matttproud/golang_protobuf_extensions v1.0.1
++github.com/gogo/protobuf v1.2.1
++github.com/gogo/googleapis v1.2.0
++github.com/golang/protobuf v1.2.0
++github.com/opencontainers/runtime-spec 29686dbc5559d93fb1ef402eeda3e35c38d75af4 # v1.0.1-59-g29686db
++github.com/opencontainers/runc f4982d86f7fde0b6f953cc62ccc4022c519a10a9 # v1.0.0-rc8-32-gf4982d86
++github.com/konsorten/go-windows-terminal-sequences v1.0.1
++github.com/sirupsen/logrus v1.4.1
++github.com/urfave/cli 7bc6a0acffa589f415f88aca16cc1de5ffd66f9c
++golang.org/x/net f3200d17e092c607f615320ecaad13d87ad9a2b3
++google.golang.org/grpc 25c4f928eaa6d96443009bd842389fb4fa48664e # v1.20.1
++github.com/pkg/errors v0.8.1
++github.com/opencontainers/go-digest c9281466c8b2f606084ac71339773efd177436e7
++golang.org/x/sys 9eafafc0a87e0fd0aeeba439a4573537970c44c7 https://github.com/golang/sys
++github.com/opencontainers/image-spec v1.0.1
++golang.org/x/sync 42b317875d0fa942474b76e1b46a6060d720ae6e
++github.com/BurntSushi/toml v0.3.1
++github.com/grpc-ecosystem/go-grpc-prometheus 6b7015e65d366bf3f19b2b2a000a831940f0f7e0
++github.com/Microsoft/go-winio v0.4.14
++github.com/Microsoft/hcsshim d64a16fba14c833a539fcff9a2eabc3191d5db30
++google.golang.org/genproto d80a6e20e776b0b17a324d0ba1ab50a39c8e8944
++golang.org/x/text 19e51611da83d6be54ddafce4a4af510cb3e9ea4
++github.com/containerd/ttrpc 1fb3814edf44a76e0ccf503decf726d994919a9a
++github.com/syndtr/gocapability d98352740cb2c55f81556b63d4a1ec64c5a319c2
++gotest.tools v2.3.0
++github.com/google/go-cmp v0.2.0
++go.etcd.io/bbolt v1.3.3
++github.com/hashicorp/errwrap 7554cd9344cec97297fa6649b055a8c98c2a1e55
++github.com/hashicorp/go-multierror ed905158d87462226a13fe39ddf685ea65f1c11f
++github.com/hashicorp/golang-lru v0.5.1
++go.opencensus.io v0.22.0
++
++# cri dependencies
++github.com/containerd/cri f1d492b0cdd14e76476ee4dd024696ce3634e501 # master
++github.com/containerd/go-cni 49fbd9b210f3c8ee3b7fd3cd797aabaf364627c1
++github.com/containernetworking/cni v0.7.1
++github.com/containernetworking/plugins v0.7.6
++github.com/davecgh/go-spew v1.1.1
++github.com/docker/distribution 0d3efadf0154c2b8a4e7b6621fff9809655cc580
++github.com/docker/docker 86f080cff0914e9694068ed78d503701667c4c00
++github.com/docker/spdystream 449fdfce4d962303d702fec724ef0ad181c92528
++github.com/emicklei/go-restful v2.2.1
++github.com/google/gofuzz 24818f796faf91cd76ec7bddd72458fbced7a6c1
++github.com/json-iterator/go 1.1.5
++github.com/modern-go/reflect2 1.0.1
++github.com/modern-go/concurrent 1.0.3
++github.com/opencontainers/selinux v1.2.2
++github.com/seccomp/libseccomp-golang v0.9.1
++github.com/tchap/go-patricia v2.2.6
++golang.org/x/crypto 88737f569e3a9c7ab309cdc09a07fe7fc87233c3
++golang.org/x/oauth2 9f3314589c9a9136388751d9adae6b0ed400978a
++golang.org/x/time f51c12702a4d776e4c1fa9b0fabab841babae631
++gopkg.in/inf.v0 v0.9.0
++gopkg.in/yaml.v2 v2.2.1
++k8s.io/api kubernetes-1.15.0
++k8s.io/apimachinery kubernetes-1.15.0
++k8s.io/apiserver kubernetes-1.15.0
++k8s.io/cri-api kubernetes-1.15.0
++k8s.io/client-go kubernetes-1.15.0
++k8s.io/klog v0.3.1
++k8s.io/kubernetes v1.15.0
++k8s.io/utils c2654d5206da6b7b6ace12841e8f359bb89b443c
++sigs.k8s.io/yaml v1.1.0
++
++# zfs dependencies
++github.com/containerd/zfs 31af176f2ae84fe142ef2655bf7bb2aa618b3b1f
++github.com/mistifyio/go-zfs f784269be439d704d3dfa1906f45dd848fed2beb
++github.com/google/uuid v1.1.1
++
++# aufs dependencies
++github.com/containerd/aufs f894a800659b6e11c1a13084abd1712f346e349c
+diff --git a/vendor/github.com/Microsoft/hcsshim/pkg/octtrpc/interceptor.go b/vendor/github.com/Microsoft/hcsshim/pkg/octtrpc/interceptor.go
+new file mode 100644
+index 000000000..4bbf9484c
+--- /dev/null
++++ b/vendor/github.com/Microsoft/hcsshim/pkg/octtrpc/interceptor.go
+@@ -0,0 +1,121 @@
++package octtrpc
++
++import (
++	"context"
++	"encoding/base64"
++	"strings"
++
++	"github.com/containerd/ttrpc"
++	"go.opencensus.io/trace"
++	"go.opencensus.io/trace/propagation"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++type options struct {
++	sampler trace.Sampler
++}
++
++// Option represents an option function that can be used with the OC TTRPC
++// interceptors.
++type Option func(*options)
++
++// WithSampler returns an option function to set the OC sampler used for the
++// auto-created spans.
++func WithSampler(sampler trace.Sampler) Option {
++	return func(opts *options) {
++		opts.sampler = sampler
++	}
++}
++
++const metadataTraceContextKey = "octtrpc.tracecontext"
++
++func convertMethodName(name string) string {
++	name = strings.TrimPrefix(name, "/")
++	name = strings.Replace(name, "/", ".", -1)
++	return name
++}
++
++func getParentSpanFromContext(ctx context.Context) (trace.SpanContext, bool) {
++	md, _ := ttrpc.GetMetadata(ctx)
++	traceContext := md[metadataTraceContextKey]
++	if len(traceContext) > 0 {
++		traceContextBinary, _ := base64.StdEncoding.DecodeString(traceContext[0])
++		return propagation.FromBinary(traceContextBinary)
++	}
++	return trace.SpanContext{}, false
++}
++
++func setSpanStatus(span *trace.Span, err error) {
++	// This error handling matches that used in ocgrpc.
++	if err != nil {
++		s, ok := status.FromError(err)
++		if ok {
++			span.SetStatus(trace.Status{Code: int32(s.Code()), Message: s.Message()})
++		} else {
++			span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: err.Error()})
++		}
++	}
++}
++
++// ClientInterceptor returns a TTRPC unary client interceptor that automatically
++// creates a new span for outgoing TTRPC calls, and passes the span context as
++// metadata on the call.
++func ClientInterceptor(opts ...Option) ttrpc.UnaryClientInterceptor {
++	o := options{}
++	for _, opt := range opts {
++		opt(&o)
++	}
++	return func(ctx context.Context, req *ttrpc.Request, resp *ttrpc.Response, info *ttrpc.UnaryClientInfo, inv ttrpc.Invoker) (err error) {
++		ctx, span := trace.StartSpan(
++			ctx,
++			convertMethodName(info.FullMethod),
++			trace.WithSampler(o.sampler),
++			trace.WithSpanKind(trace.SpanKindClient))
++		defer span.End()
++		defer setSpanStatus(span, err)
++
++		spanContextBinary := propagation.Binary(span.SpanContext())
++		b64 := base64.StdEncoding.EncodeToString(spanContextBinary)
++		kvp := &ttrpc.KeyValue{Key: metadataTraceContextKey, Value: b64}
++		req.Metadata = append(req.Metadata, kvp)
++
++		return inv(ctx, req, resp)
++	}
++}
++
++// ServerInterceptor returns a TTRPC unary server interceptor that automatically
++// creates a new span for incoming TTRPC calls, and parents the span to the
++// span context received via metadata, if it exists.
++func ServerInterceptor(opts ...Option) ttrpc.UnaryServerInterceptor {
++	o := options{}
++	for _, opt := range opts {
++		opt(&o)
++	}
++	return func(ctx context.Context, unmarshal ttrpc.Unmarshaler, info *ttrpc.UnaryServerInfo, method ttrpc.Method) (_ interface{}, err error) {
++		name := convertMethodName(info.FullMethod)
++
++		var span *trace.Span
++		parent, ok := getParentSpanFromContext(ctx)
++		if ok {
++			ctx, span = trace.StartSpanWithRemoteParent(
++				ctx,
++				name,
++				parent,
++				trace.WithSpanKind(trace.SpanKindServer),
++				trace.WithSampler(o.sampler),
++			)
++		} else {
++			ctx, span = trace.StartSpan(
++				ctx,
++				name,
++				trace.WithSpanKind(trace.SpanKindServer),
++				trace.WithSampler(o.sampler),
++			)
++		}
++		defer span.End()
++		defer setSpanStatus(span, err)
++
++		return method(ctx, unmarshal)
++	}
++}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 8728cb8d7..f83656264 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -47,6 +47,7 @@ github.com/Microsoft/hcsshim/internal/winapi
+ github.com/Microsoft/hcsshim/osversion
+ github.com/Microsoft/hcsshim/pkg/go-runhcs
+ github.com/Microsoft/hcsshim/pkg/ociwclayer
++github.com/Microsoft/hcsshim/pkg/octtrpc
+ # github.com/beorn7/perks v1.0.1
+ ## explicit; go 1.11
+ github.com/beorn7/perks/quantile

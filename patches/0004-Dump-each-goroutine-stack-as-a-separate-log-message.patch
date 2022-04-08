@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kevin Parsons <kevpar@microsoft.com>
+Date: Mon, 7 Dec 2020 12:00:26 -0800
+Subject: [PATCH] Dump each goroutine stack as a separate log message
+
+This changes the stack dumping code so that we split the giant string
+containing every goroutine's stack and log each stack as a separate log
+message. This makes the output easier to parse, and especially helps in
+cases where the log output is sent through a system with a log message
+size limit, such as Windows's ETW.
+
+Signed-off-by: Kevin Parsons <kevpar@microsoft.com>
+---
+ cmd/containerd/command/main.go | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/cmd/containerd/command/main.go b/cmd/containerd/command/main.go
+index 34447767d..1f92f5a13 100644
+--- a/cmd/containerd/command/main.go
++++ b/cmd/containerd/command/main.go
+@@ -25,6 +25,7 @@ import (
+ 	"os/signal"
+ 	"path/filepath"
+ 	"runtime"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/containerd/containerd/defaults"
+@@ -391,7 +392,15 @@ func dumpStacks(writeToFile bool) {
+ 		bufferLen *= 2
+ 	}
+ 	buf = buf[:stackSize]
+-	logrus.Infof("=== BEGIN goroutine stack dump ===\n%s\n=== END goroutine stack dump ===", buf)
++	stacks := strings.Split(string(buf), "\n\n")
++	logrus.WithField("stackCount", len(stacks)).Info("Begin goroutine stack dump")
++	for i, stack := range stacks {
++		logrus.WithFields(logrus.Fields{
++			"index": i,
++			"stack": stack,
++		}).Info("Dumping goroutine stack")
++	}
++	logrus.Info("End goroutine stack dump")
+ 
+ 	if writeToFile {
+ 		// Also write to file to aid gathering diagnostics

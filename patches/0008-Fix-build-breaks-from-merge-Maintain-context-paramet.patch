@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kathryn Baldauf <kabaldau@microsoft.com>
+Date: Thu, 6 Jan 2022 18:47:22 -0800
+Subject: [PATCH] Fix build breaks from merge * Maintain context parameter to
+ bundle deletion * Remove custom signals changes and related files * Remove
+ unnecessary snapshots windows and lcow files
+
+Signed-off-by: Kathryn Baldauf <kabaldau@microsoft.com>
+---
+ signals.go             | 3 ---
+ snapshots/lcow/lcow.go | 4 ----
+ 2 files changed, 7 deletions(-)
+
+diff --git a/signals.go b/signals.go
+index 9d81eed87..49d8beec0 100644
+--- a/signals.go
++++ b/signals.go
+@@ -1,12 +1,9 @@
+ /*
+    Copyright The containerd Authors.
+-
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+-
+        http://www.apache.org/licenses/LICENSE-2.0
+-
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+diff --git a/snapshots/lcow/lcow.go b/snapshots/lcow/lcow.go
+index c459aea27..38d94f6df 100644
+--- a/snapshots/lcow/lcow.go
++++ b/snapshots/lcow/lcow.go
+@@ -1,15 +1,11 @@
+-//go:build windows
+ // +build windows
+ 
+ /*
+    Copyright The containerd Authors.
+-
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+-
+        http://www.apache.org/licenses/LICENSE-2.0
+-
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
