@@ -22,6 +22,7 @@ import (
 	"os"
 	"time"
 
+	_ "github.com/containerd/containerd"
 	_ "github.com/containerd/containerd/diff/walking/plugin"
 	_ "github.com/containerd/containerd/events/plugin"
 	_ "github.com/containerd/containerd/gc/scheduler"
@@ -37,6 +38,7 @@ import (
 	_ "github.com/containerd/containerd/services/snapshots"
 	_ "github.com/containerd/containerd/services/tasks"
 	_ "github.com/containerd/containerd/services/version"
+	_ "github.com/containerd/containerd/version"
 
 	"github.com/containerd/containerd/cmd/containerd/command"
 )

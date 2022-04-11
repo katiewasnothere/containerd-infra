@@ -41,6 +41,9 @@ github.com/Microsoft/hcsshim/pkg/octtrpc
 # github.com/beorn7/perks v1.0.1
 ## explicit; go 1.11
 github.com/beorn7/perks/quantile
+# github.com/blang/semver v3.5.1+incompatible
+## explicit
+github.com/blang/semver
 # github.com/cespare/xxhash/v2 v2.1.2
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
@@ -52,6 +55,11 @@ github.com/cilium/ebpf/internal
 github.com/cilium/ebpf/internal/btf
 github.com/cilium/ebpf/internal/unix
 github.com/cilium/ebpf/link
+# github.com/container-orchestrated-devices/container-device-interface v0.3.1
+## explicit; go 1.17
+github.com/container-orchestrated-devices/container-device-interface/pkg/cdi
+github.com/container-orchestrated-devices/container-device-interface/schema
+github.com/container-orchestrated-devices/container-device-interface/specs-go
 # github.com/containerd/cgroups v1.0.3
 ## explicit; go 1.16
 github.com/containerd/cgroups
@@ -63,6 +71,7 @@ github.com/containerd/cgroups/v2/stats
 github.com/containerd/console
 # github.com/containerd/containerd v1.5.10 => ./containerd
 ## explicit; go 1.18
+github.com/containerd/containerd
 github.com/containerd/containerd/api/events
 github.com/containerd/containerd/api/services/containers/v1
 github.com/containerd/containerd/api/services/content/v1
@@ -80,6 +89,7 @@ github.com/containerd/containerd/api/types
 github.com/containerd/containerd/api/types/task
 github.com/containerd/containerd/archive
 github.com/containerd/containerd/archive/compression
+github.com/containerd/containerd/cio
 github.com/containerd/containerd/cmd/containerd/command
 github.com/containerd/containerd/containers
 github.com/containerd/containerd/content
@@ -101,8 +111,10 @@ github.com/containerd/containerd/gc
 github.com/containerd/containerd/gc/scheduler
 github.com/containerd/containerd/identifiers
 github.com/containerd/containerd/images
+github.com/containerd/containerd/images/archive
 github.com/containerd/containerd/labels
 github.com/containerd/containerd/leases
+github.com/containerd/containerd/leases/proxy
 github.com/containerd/containerd/log
 github.com/containerd/containerd/metadata
 github.com/containerd/containerd/metadata/boltutil
@@ -115,8 +127,11 @@ github.com/containerd/containerd/metrics/types/v2
 github.com/containerd/containerd/mount
 github.com/containerd/containerd/namespaces
 github.com/containerd/containerd/oc
+github.com/containerd/containerd/oci
+github.com/containerd/containerd/pkg/cap
 github.com/containerd/containerd/pkg/dialer
 github.com/containerd/containerd/pkg/ioutil
+github.com/containerd/containerd/pkg/kmutex
 github.com/containerd/containerd/pkg/process
 github.com/containerd/containerd/pkg/shutdown
 github.com/containerd/containerd/pkg/stdio
@@ -127,6 +142,14 @@ github.com/containerd/containerd/platforms
 github.com/containerd/containerd/plugin
 github.com/containerd/containerd/protobuf
 github.com/containerd/containerd/protobuf/plugin
+github.com/containerd/containerd/reference
+github.com/containerd/containerd/reference/docker
+github.com/containerd/containerd/remotes
+github.com/containerd/containerd/remotes/docker
+github.com/containerd/containerd/remotes/docker/auth
+github.com/containerd/containerd/remotes/docker/schema1
+github.com/containerd/containerd/remotes/errors
+github.com/containerd/containerd/rootfs
 github.com/containerd/containerd/runtime
 github.com/containerd/containerd/runtime/linux/runctypes
 github.com/containerd/containerd/runtime/v1
@@ -259,19 +282,44 @@ github.com/klauspost/compress/zstd/internal/xxhash
 # github.com/matttproud/golang_protobuf_extensions v1.0.2-0.20181231171920-c182affec369
 ## explicit; go 1.9
 github.com/matttproud/golang_protobuf_extensions/pbutil
+# github.com/moby/locker v1.0.1
+## explicit; go 1.13
+github.com/moby/locker
 # github.com/moby/sys/mountinfo v0.6.0
 ## explicit; go 1.16
 github.com/moby/sys/mountinfo
+# github.com/moby/sys/signal v0.7.0
+## explicit; go 1.16
+github.com/moby/sys/signal
 # github.com/opencontainers/go-digest v1.0.0
 ## explicit; go 1.13
 github.com/opencontainers/go-digest
 # github.com/opencontainers/image-spec v1.0.3-0.20220303224323-02efb9a75ee1
 ## explicit; go 1.16
+github.com/opencontainers/image-spec/identity
 github.com/opencontainers/image-spec/specs-go
 github.com/opencontainers/image-spec/specs-go/v1
+# github.com/opencontainers/runc v1.1.1
+## explicit; go 1.16
+github.com/opencontainers/runc/libcontainer/devices
+github.com/opencontainers/runc/libcontainer/user
 # github.com/opencontainers/runtime-spec v1.0.3-0.20210326190908-1c3f411f0417
 ## explicit
 github.com/opencontainers/runtime-spec/specs-go
+# github.com/opencontainers/runtime-tools v0.0.0-20190417131837-cd1349b7c47e
+## explicit
+github.com/opencontainers/runtime-tools/error
+github.com/opencontainers/runtime-tools/filepath
+github.com/opencontainers/runtime-tools/generate
+github.com/opencontainers/runtime-tools/generate/seccomp
+github.com/opencontainers/runtime-tools/specerror
+github.com/opencontainers/runtime-tools/validate
+# github.com/opencontainers/selinux v1.10.0
+## explicit; go 1.13
+github.com/opencontainers/selinux/go-selinux
+github.com/opencontainers/selinux/go-selinux/label
+github.com/opencontainers/selinux/pkg/pwalk
+github.com/opencontainers/selinux/pkg/pwalkdir
 # github.com/pelletier/go-toml v1.9.3
 ## explicit; go 1.12
 github.com/pelletier/go-toml
@@ -305,9 +353,21 @@ github.com/shurcooL/sanitized_anchor_name
 # github.com/sirupsen/logrus v1.8.1
 ## explicit; go 1.13
 github.com/sirupsen/logrus
+# github.com/syndtr/gocapability v0.0.0-20200815063812-42c35b437635
+## explicit
+github.com/syndtr/gocapability/capability
 # github.com/urfave/cli v1.22.2
 ## explicit; go 1.11
 github.com/urfave/cli
+# github.com/xeipuuv/gojsonpointer v0.0.0-20180127040702-4e3ac2762d5f
+## explicit
+github.com/xeipuuv/gojsonpointer
+# github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415
+## explicit
+github.com/xeipuuv/gojsonreference
+# github.com/xeipuuv/gojsonschema v1.2.0
+## explicit
+github.com/xeipuuv/gojsonschema
 # go.etcd.io/bbolt v1.3.6
 ## explicit; go 1.12
 go.etcd.io/bbolt
